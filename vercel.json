@@ -1,13 +1,13 @@
 {
   "functions": {
-    "app.py": {
+    "api/app.py": {
       "maxDuration": 30
     }
   },
   "rewrites": [
     {
       "source": "/(.*)",
-      "destination": "/app.py"
+      "destination": "/api/app.py"
     }
   ]
 }
