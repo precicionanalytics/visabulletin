@@ -277,6 +277,33 @@ TEMPLATE = """
     textarea:focus { outline: none; border-color: #ffd700; }
 
     .hint { margin-top: 10px; color: #555; font-size: 0.78rem; }
+
+    .prompt-section { margin-top: 28px; display: none; }
+    .prompt-section .section-title {
+      font-size: 0.85rem;
+      color: #ffd700;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 10px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .prompt-ta {
+      width: 100%;
+      height: 200px;
+      background: #0b1f3a;
+      border: 1px solid #2a4a6a;
+      border-radius: 6px;
+      color: #ffe082;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 0.85rem;
+      line-height: 1.6;
+      padding: 12px;
+      resize: vertical;
+    }
+    .prompt-ta:focus { outline: none; border-color: #ffd700; }
   </style>
 </head>
 <body>
@@ -300,6 +327,14 @@ TEMPLATE = """
         <button class="copy-btn" onclick="copyCSV()">Copy CSV</button>
       </div>
       <textarea id="csvOutput" readonly></textarea>
+    </div>
+
+    <div class="prompt-section" id="promptSection">
+      <div class="section-title">
+        <span>Copy Prompt</span>
+        <button class="copy-btn" onclick="copyPrompt()">Copy Prompt</button>
+      </div>
+      <textarea class="prompt-ta" id="promptOutput" readonly></textarea>
     </div>
   </div>
 
@@ -332,6 +367,12 @@ TEMPLATE = """
           document.getElementById('resultLabel').textContent =
             data.prev_label + '  →  ' + data.curr_label;
           resultSection.style.display = 'block';
+
+          // Build and show the ChatGPT prompt
+          const prompt =
+            `Generate fb page image for my Facebook page name "U.S. Immigration Hub" include my page name in image for Visa bulletin ${data.curr_label} vs ${data.prev_label} comparison. Refer attached image to follow the same theme and pattern as image attached\n\nHere is the ${data.curr_label} vs ${data.prev_label} data:\n${data.csv}`;
+          document.getElementById('promptOutput').value = prompt;
+          document.getElementById('promptSection').style.display = 'block';
         }
       } catch (err) {
         errorBox.textContent = 'Request failed: ' + err.message;
@@ -349,6 +390,17 @@ TEMPLATE = """
         const btn = document.querySelector('.copy-btn');
         btn.textContent = 'Copied!';
         setTimeout(() => btn.textContent = 'Copy CSV', 1800);
+      });
+    }
+
+    function copyPrompt() {
+      const ta = document.getElementById('promptOutput');
+      ta.select();
+      navigator.clipboard.writeText(ta.value).then(() => {
+        const btns = document.querySelectorAll('.copy-btn');
+        const btn = btns[btns.length - 1];
+        btn.textContent = 'Copied!';
+        setTimeout(() => btn.textContent = 'Copy Prompt', 1800);
       });
     }
 
