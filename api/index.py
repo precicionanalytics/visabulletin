@@ -85,12 +85,15 @@ def _table_to_dict(table) -> dict:
     rows = table.find_all("tr")
     data = {}
     for i, cat in enumerate(["1st", "2nd", "3rd"]):
+        if len(rows) <= i + 1:
+            data[cat] = {"ROW": "", "China": "", "India": ""}
+            continue
         cols = rows[i + 1].find_all(["td", "th"])
         vals = [c.get_text(strip=True) for c in cols]
         data[cat] = {
-            "ROW":   parse_date(vals[1]),
-            "China": parse_date(vals[2]),
-            "India": parse_date(vals[3]),
+            "ROW":   parse_date(vals[1]) if len(vals) > 1 else "",
+            "China": parse_date(vals[2]) if len(vals) > 2 else "",
+            "India": parse_date(vals[3]) if len(vals) > 3 else "",
         }
     return data
 
@@ -147,6 +150,27 @@ def _parse_pdf_label(pdf_bytes: bytes):
     return None
 
 
+def _parse_label_from_filename(filename: str):
+    if not filename:
+        return None
+    month_match = re.search(r"([A-Za-z]+)[-_ ]+(\d{4})", filename)
+    if month_match:
+        month_name, year = month_match.group(1), month_match.group(2)
+        try:
+            month_dt = dparser.parse(f"{month_name} {year}")
+            return month_dt.strftime("%B %Y")
+        except Exception:
+            return f"{month_name} {year}"
+    month_only = re.search(r"(January|February|March|April|May|June|July|August|September|October|November|December)", filename, re.IGNORECASE)
+    if month_only:
+        try:
+            month_dt = dparser.parse(month_only.group(1))
+            return month_dt.strftime("%B %Y")
+        except Exception:
+            return month_only.group(1).title()
+    return None
+
+
 def _table_rows_to_dict(table_rows) -> dict:
     if not table_rows:
         return {}
@@ -166,9 +190,17 @@ def _table_rows_to_dict(table_rows) -> dict:
     return data
 
 
-def generate_csv_from_pdf(previous_pdf: bytes, current_pdf: bytes) -> tuple[str, str, str, str]:
-    prev_label = _parse_pdf_label(previous_pdf) or "Previous"
-    curr_label = _parse_pdf_label(current_pdf) or "Current"
+def generate_csv_from_pdf(previous_pdf: bytes, current_pdf: bytes, previous_filename: str = None, current_filename: str = None) -> tuple[str, str, str, str]:
+    prev_label = (
+        _parse_pdf_label(previous_pdf)
+        or _parse_label_from_filename(previous_filename)
+        or "Previous Month"
+    )
+    curr_label = (
+        _parse_pdf_label(current_pdf)
+        or _parse_label_from_filename(current_filename)
+        or "Current Month"
+    )
 
     prev_final, prev_filing = _find_eb_tables_from_pdf(previous_pdf)
     curr_final, curr_filing = _find_eb_tables_from_pdf(current_pdf)
@@ -202,11 +234,11 @@ def generate_csv_from_pdf(previous_pdf: bytes, current_pdf: bytes) -> tuple[str,
 
 def _build_comparison(old_dict: dict, new_dict: dict) -> dict:
     result = {}
-    for cat in new_dict:
+    for cat in ("1st", "2nd", "3rd"):
         result[cat] = {}
         for country in ("India", "China", "ROW"):
-            old = old_dict[cat][country]
-            new = new_dict[cat][country]
+            old = old_dict.get(cat, {}).get(country, "")
+            new = new_dict.get(cat, {}).get(country, "")
             result[cat][country] = {
                 "old":  old,
                 "new":  new,
@@ -604,10 +636,29 @@ def index():
 
 @app.post("/generate")
 def generate():
-    body        = request.get_json(silent=True) or {}
-    month_input = (body.get("month") or "").strip()
+    # Check for file upload (multipart form data)
+    if request.files:
+        previous_file = request.files.get("previous_pdf")
+        current_file = request.files.get("current_pdf")
+        if not previous_file or not current_file:
+            return jsonify({"error": "Please upload both previous and current Visa Bulletin PDFs."}), 400
 
-    csv_text, prev_label, curr_label, error = generate_csv(month_input)
+        try:
+            previous_pdf = previous_file.read()
+            current_pdf = current_file.read()
+            csv_text, prev_label, curr_label, error = generate_csv_from_pdf(
+                previous_pdf,
+                current_pdf,
+                previous_filename=previous_file.filename,
+                current_filename=current_file.filename,
+            )
+        except Exception as exc:
+            return jsonify({"error": f"PDF parsing failed: {str(exc)}"}), 400
+    else:
+        # Handle JSON requests for month-based generation
+        body = request.get_json(silent=True) or {}
+        month_input = (body.get("month") or "").strip()
+        csv_text, prev_label, curr_label, error = generate_csv(month_input)
 
     if error:
         return jsonify({"error": error}), 400
