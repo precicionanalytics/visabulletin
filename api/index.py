@@ -7,16 +7,21 @@ Endpoints:
   POST /generate — scrapes bulletin and returns CSV in a copyable textarea
 """
 
+import io
+import os
+import re
 import sys
 from datetime import datetime
 from dateutil import parser as dparser
 from dateutil.relativedelta import relativedelta
 
+import pdfplumber
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, render_template_string, request, jsonify
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
 # Core scraping helpers (shared with visa_bulletin.py logic)
@@ -87,6 +92,111 @@ def _table_to_dict(table) -> dict:
             "India": parse_date(vals[3]),
         }
     return data
+
+
+def _normalize_pdf_cell(value):
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _rows_from_pdf_bytes(pdf_bytes: bytes):
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        tables = []
+        for page in pdf.pages:
+            for table in page.extract_tables():
+                if not table:
+                    continue
+                normalized = [
+                    [_normalize_pdf_cell(cell) for cell in row]
+                    for row in table
+                    if any(_normalize_pdf_cell(cell) for cell in row)
+                ]
+                if normalized:
+                    tables.append(normalized)
+        return tables
+
+
+def _find_eb_tables_from_pdf(pdf_bytes: bytes):
+    tables = _rows_from_pdf_bytes(pdf_bytes)
+    eb_tables = []
+    for table in tables:
+        flat_text = " ".join(cell.lower() for row in table for cell in row if cell)
+        if "china" in flat_text and "india" in flat_text and any(word in flat_text for word in ["1st", "2nd", "3rd"]):
+            eb_tables.append(table)
+    if len(eb_tables) >= 2:
+        return eb_tables[0], eb_tables[1]
+    if len(eb_tables) == 1:
+        return eb_tables[0], None
+    return None, None
+
+
+def _parse_pdf_label(pdf_bytes: bytes):
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+    month_match = re.search(r"visa bulletin(?: for)?\s+([A-Za-z]+)\s+(\d{4})", text, re.IGNORECASE)
+    if month_match:
+        month_name = month_match.group(1)
+        year = month_match.group(2)
+        try:
+            month_dt = dparser.parse(f"{month_name} {year}")
+            return month_dt.strftime("%B %Y")
+        except Exception:
+            return f"{month_name} {year}"
+    return None
+
+
+def _table_rows_to_dict(table_rows) -> dict:
+    if not table_rows:
+        return {}
+    data = {}
+    for row in table_rows:
+        if not row:
+            continue
+        first = row[0].strip().lower()
+        if first in ("1st", "2nd", "3rd"):
+            values = [cell.strip() for cell in row[1:]]
+            if len(values) >= 3:
+                data[first] = {
+                    "ROW":   parse_date(values[0]),
+                    "China": parse_date(values[1]),
+                    "India": parse_date(values[2]),
+                }
+    return data
+
+
+def generate_csv_from_pdf(previous_pdf: bytes, current_pdf: bytes) -> tuple[str, str, str, str]:
+    prev_label = _parse_pdf_label(previous_pdf) or "Previous"
+    curr_label = _parse_pdf_label(current_pdf) or "Current"
+
+    prev_final, prev_filing = _find_eb_tables_from_pdf(previous_pdf)
+    curr_final, curr_filing = _find_eb_tables_from_pdf(current_pdf)
+
+    if not curr_final:
+        return "", prev_label, curr_label, (
+            "Could not find the employment-based table in the current PDF. "
+            "Please make sure the PDF contains the Visa Bulletin employment-based tables."
+        )
+
+    final = _build_comparison(_table_rows_to_dict(prev_final), _table_rows_to_dict(curr_final))
+    filing = _build_comparison(_table_rows_to_dict(prev_filing), _table_rows_to_dict(curr_filing)) if prev_filing and curr_filing else {}
+
+    lines = [f"Table,Category,Country,{prev_label},{curr_label}"]
+    for tbl_label, data_dict in [
+        ("Final Action Dates", final),
+        ("Dates for Filing", filing),
+    ]:
+        if not data_dict:
+            continue
+        for cat_key, eb_label in [("1st", "EB1"), ("2nd", "EB2"), ("3rd", "EB3")]:
+            for country in ("ROW", "China", "India"):
+                item = data_dict[cat_key][country]
+                lines.append(
+                    f"{tbl_label},{eb_label},{country},"
+                    f"{to_display(item['old'])},{to_display(item['new'])}"
+                )
+
+    return "\n".join(lines), prev_label, curr_label, ""
 
 
 def _build_comparison(old_dict: dict, new_dict: dict) -> dict:
@@ -318,6 +428,14 @@ TEMPLATE = """
       <span class="spinner" id="spinner">⏳ Loading…</span>
     </div>
     <p class="hint">Compares the entered month against the previous month. Blank = uses today's month as previous, next month as current.</p>
+    <hr />
+    <label>Upload two Visa Bulletin PDFs</label>
+    <div class="row">
+      <input type="file" id="previousPdf" accept="application/pdf">
+      <input type="file" id="currentPdf" accept="application/pdf">
+      <button id="uploadBtn" onclick="uploadPdfs()">Upload PDFs</button>
+    </div>
+    <p class="hint">Upload a previous-month PDF and a current-month PDF to generate CSV directly from the bulletin files.</p>
 
     <div class="error" id="errorBox"></div>
 
@@ -369,6 +487,59 @@ TEMPLATE = """
           resultSection.style.display = 'block';
 
           // Build and show the ChatGPT prompt
+          const prompt =
+            `Generate fb page image for my Facebook page name "U.S. Immigration Hub" include my page name in image for Visa bulletin ${data.curr_label} vs ${data.prev_label} comparison. Refer attached image to follow the same theme and pattern as image attached\n\nHere is the ${data.curr_label} vs ${data.prev_label} data:\n${data.csv}`;
+          document.getElementById('promptOutput').value = prompt;
+          document.getElementById('promptSection').style.display = 'block';
+        }
+      } catch (err) {
+        errorBox.textContent = 'Request failed: ' + err.message;
+        errorBox.style.display = 'block';
+      } finally {
+        btn.disabled = false;
+        spinner.style.display = 'none';
+      }
+    }
+
+    async function uploadPdfs() {
+      const prev = document.getElementById('previousPdf').files[0];
+      const curr = document.getElementById('currentPdf').files[0];
+      const btn = document.getElementById('uploadBtn');
+      const spinner = document.getElementById('spinner');
+      const errorBox = document.getElementById('errorBox');
+      const resultSection = document.getElementById('resultSection');
+
+      if (!prev || !curr) {
+        errorBox.textContent = 'Please select both PDF files.';
+        errorBox.style.display = 'block';
+        return;
+      }
+
+      btn.disabled = true;
+      spinner.style.display = 'inline';
+      errorBox.style.display = 'none';
+      resultSection.style.display = 'none';
+
+      const formData = new FormData();
+      formData.append('previous_pdf', prev);
+      formData.append('current_pdf', curr);
+
+      try {
+        const resp = await fetch('/generate', {
+          method: 'POST',
+          body: formData,
+        });
+        const data = await resp.json();
+
+        if (data.error) {
+          errorBox.textContent = data.error;
+          errorBox.style.display = 'block';
+        } else {
+          document.getElementById('csvOutput').value = data.csv;
+          document.getElementById('resultLabel').textContent =
+            data.prev_label + '  →  ' + data.curr_label;
+          resultSection.style.display = 'block';
+
           const prompt =
             `Generate fb page image for my Facebook page name "U.S. Immigration Hub" include my page name in image for Visa bulletin ${data.curr_label} vs ${data.prev_label} comparison. Refer attached image to follow the same theme and pattern as image attached\n\nHere is the ${data.curr_label} vs ${data.prev_label} data:\n${data.csv}`;
           document.getElementById('promptOutput').value = prompt;
