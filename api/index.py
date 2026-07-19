@@ -66,6 +66,90 @@ def date_diff(old, new) -> int:
     return 0
 
 
+def _movement_text(old, new, diff: int) -> str:
+  if isinstance(old, datetime) and isinstance(new, datetime):
+    if diff > 0:
+      return "Forward"
+    if diff < 0:
+      return "Retrogression"
+    return "No Change"
+  return "N/A"
+
+
+def _change_days_text(old, new, diff: int) -> str:
+  if isinstance(old, datetime) and isinstance(new, datetime):
+    return str(diff)
+  return ""
+
+
+def _build_csv_text(prev_label: str, curr_label: str, final: dict, filing: dict) -> str:
+  lines = [f"Table,Category,Country,{prev_label},{curr_label},ChangeDays,Movement"]
+  for tbl_label, data_dict in [
+    ("Final Action Dates", final),
+    ("Dates for Filing", filing),
+  ]:
+    if not data_dict:
+      continue
+    for cat_key, eb_label in [("1st", "EB1"), ("2nd", "EB2"), ("3rd", "EB3")]:
+      for country in ("ROW", "China", "India"):
+        item = data_dict[cat_key][country]
+        old = item["old"]
+        new = item["new"]
+        diff = item["diff"]
+        lines.append(
+          f"{tbl_label},{eb_label},{country},"
+          f"{to_display(old)},{to_display(new)},"
+          f"{_change_days_text(old, new, diff)},"
+          f"{_movement_text(old, new, diff)}"
+        )
+  return "\n".join(lines)
+
+
+def _build_movement_summary(final: dict, filing: dict) -> list[str]:
+  points = []
+  for tbl_label, data_dict in [("Final Action", final), ("Filing", filing)]:
+    if not data_dict:
+      continue
+    for cat_key, eb_label in [("1st", "EB1"), ("2nd", "EB2"), ("3rd", "EB3")]:
+      for country in ("India", "China", "ROW"):
+        item = data_dict[cat_key][country]
+        old = item["old"]
+        new = item["new"]
+        diff = item["diff"]
+        if not isinstance(old, datetime) or not isinstance(new, datetime):
+          continue
+        if diff != 0:
+          direction = "forward" if diff > 0 else "retrogressed"
+          points.append(
+            f"- {tbl_label} {eb_label} {country} {direction} by {abs(diff)} days"
+          )
+
+  if not points:
+    return ["- Most categories are unchanged or marked Current/Unavailable."]
+
+  return points[:6]
+
+
+def _build_image_prompt(prev_label: str, curr_label: str, csv_text: str, final: dict, filing: dict) -> str:
+  summary = "\n".join(_build_movement_summary(final, filing))
+  return (
+    "Create a high-quality Facebook infographic in the same visual style as my sample image for page name \"U.S. Immigration Hub\".\n"
+    f"Title: VISA BULLETIN - {curr_label.upper()}\n"
+    "Subtitle: EMPLOYMENT-BASED PREFERENCES (EB-1, EB-2 & EB-3)\n\n"
+    f"Comparison period: {prev_label} -> {curr_label}\n"
+    "Build two side-by-side sections: FINAL ACTION DATES and DATES FOR FILING.\n"
+    "For each table, include columns: Category, Country, Previous Month, Current Month, Change.\n"
+    "Use arrows and color coding: green up arrow for forward movement, red down arrow for retrogression, neutral for no change.\n"
+    "Show change in days where both values are real dates.\n"
+    "Include a Movement Summary box with concise bullet points.\n"
+    "Keep branding prominent with U.S. Immigration Hub text and a professional immigration-news look.\n\n"
+    "Movement Summary Notes:\n"
+    f"{summary}\n\n"
+    "Use this exact data:\n"
+    f"{csv_text}"
+  )
+
+
 def _get_eb_tables(html: str):
     """Return (final_action_table, dates_for_filing_table) BeautifulSoup objects."""
     soup = BeautifulSoup(html, "html.parser")
@@ -190,7 +274,7 @@ def _table_rows_to_dict(table_rows) -> dict:
     return data
 
 
-def generate_csv_from_pdf(previous_pdf: bytes, current_pdf: bytes, previous_filename: str = None, current_filename: str = None) -> tuple[str, str, str, str]:
+def generate_csv_from_pdf(previous_pdf: bytes, current_pdf: bytes, previous_filename: str = None, current_filename: str = None) -> tuple[str, str, str, str, str]:
     prev_label = (
         _parse_pdf_label(previous_pdf)
         or _parse_label_from_filename(previous_filename)
@@ -206,30 +290,16 @@ def generate_csv_from_pdf(previous_pdf: bytes, current_pdf: bytes, previous_file
     curr_final, curr_filing = _find_eb_tables_from_pdf(current_pdf)
 
     if not curr_final:
-        return "", prev_label, curr_label, (
+      return "", prev_label, curr_label, (
             "Could not find the employment-based table in the current PDF. "
             "Please make sure the PDF contains the Visa Bulletin employment-based tables."
-        )
+      ), ""
 
     final = _build_comparison(_table_rows_to_dict(prev_final), _table_rows_to_dict(curr_final))
     filing = _build_comparison(_table_rows_to_dict(prev_filing), _table_rows_to_dict(curr_filing)) if prev_filing and curr_filing else {}
-
-    lines = [f"Table,Category,Country,{prev_label},{curr_label}"]
-    for tbl_label, data_dict in [
-        ("Final Action Dates", final),
-        ("Dates for Filing", filing),
-    ]:
-        if not data_dict:
-            continue
-        for cat_key, eb_label in [("1st", "EB1"), ("2nd", "EB2"), ("3rd", "EB3")]:
-            for country in ("ROW", "China", "India"):
-                item = data_dict[cat_key][country]
-                lines.append(
-                    f"{tbl_label},{eb_label},{country},"
-                    f"{to_display(item['old'])},{to_display(item['new'])}"
-                )
-
-    return "\n".join(lines), prev_label, curr_label, ""
+    csv_text = _build_csv_text(prev_label, curr_label, final, filing)
+    prompt_text = _build_image_prompt(prev_label, curr_label, csv_text, final, filing)
+    return csv_text, prev_label, curr_label, "", prompt_text
 
 
 def _build_comparison(old_dict: dict, new_dict: dict) -> dict:
@@ -247,7 +317,7 @@ def _build_comparison(old_dict: dict, new_dict: dict) -> dict:
     return result
 
 
-def generate_csv(month_input: str) -> tuple[str, str, str, str]:
+def generate_csv(month_input: str) -> tuple[str, str, str, str, str]:
     """
     Scrape and build CSV text.
     Returns (csv_text, prev_label, curr_label, error_message).
@@ -258,7 +328,7 @@ def generate_csv(month_input: str) -> tuple[str, str, str, str]:
         try:
             current_dt = dparser.parse(month_input + " 2026").replace(day=1)
         except Exception:
-            return "", "", "", f"Could not parse month '{month_input}'. Try e.g. 'july'."
+          return "", "", "", f"Could not parse month '{month_input}'. Try e.g. 'july'.", ""
     else:
         today = datetime.today().replace(day=1)
         current_dt = today + relativedelta(months=1)
@@ -272,37 +342,23 @@ def generate_csv(month_input: str) -> tuple[str, str, str, str]:
         prev_html = requests.get(build_url(previous_dt), timeout=15).text
         curr_html = requests.get(build_url(current_dt),  timeout=15).text
     except requests.RequestException as exc:
-        return "", prev_label, curr_label, f"Network error: {exc}"
+      return "", prev_label, curr_label, f"Network error: {exc}", ""
 
     prev_final, prev_filing = _get_eb_tables(prev_html)
     curr_final, curr_filing = _get_eb_tables(curr_html)
 
     if not curr_final:
-        return "", prev_label, curr_label, (
+      return "", prev_label, curr_label, (
             f"Could not find employment-based table for {curr_label}. "
             "The bulletin may not be published yet."
-        )
+      ), ""
 
     final   = _build_comparison(_table_to_dict(prev_final),  _table_to_dict(curr_final))
     filing  = _build_comparison(_table_to_dict(prev_filing), _table_to_dict(curr_filing)) \
               if prev_filing and curr_filing else {}
-
-    lines = [f"Table,Category,Country,{prev_label},{curr_label}"]
-    for tbl_label, data_dict in [
-        ("Final Action Dates", final),
-        ("Dates for Filing",   filing),
-    ]:
-        if not data_dict:
-            continue
-        for cat_key, eb_label in [("1st", "EB1"), ("2nd", "EB2"), ("3rd", "EB3")]:
-            for country in ("ROW", "China", "India"):
-                item = data_dict[cat_key][country]
-                lines.append(
-                    f"{tbl_label},{eb_label},{country},"
-                    f"{to_display(item['old'])},{to_display(item['new'])}"
-                )
-
-    return "\n".join(lines), prev_label, curr_label, ""
+    csv_text = _build_csv_text(prev_label, curr_label, final, filing)
+    prompt_text = _build_image_prompt(prev_label, curr_label, csv_text, final, filing)
+    return csv_text, prev_label, curr_label, "", prompt_text
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +400,25 @@ TEMPLATE = """
     label { font-size: 0.9rem; color: #aaa; display: block; margin-bottom: 6px; }
 
     .row { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
+
+    .file-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    .file-input { display: none; }
+    .file-picker-btn {
+      padding: 10px 14px;
+      background: #f5f5f5;
+      color: #111;
+      border: 1px solid #999;
+      border-radius: 6px;
+      font-size: 0.95rem;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .file-picker-btn:hover { background: #e9e9e9; }
+    .file-name {
+      min-width: 180px;
+      color: #d6d6d6;
+      font-size: 0.95rem;
+    }
 
     input[type=text] {
       flex: 1;
@@ -462,13 +537,20 @@ TEMPLATE = """
     </div>
     <p class="hint">Compares the entered month against the previous month. Blank = uses today's month as previous, next month as current.</p>
     <hr />
-    <label>Upload two Visa Bulletin PDFs</label>
-    <div class="row">
-      <input type="file" id="previousPdf" accept="application/pdf">
-      <input type="file" id="currentPdf" accept="application/pdf">
-      <button id="uploadBtn" onclick="uploadPdfs()">Upload PDFs</button>
+    <label>Upload Visa Bulletin PDF files (order matters)</label>
+    <div class="file-row">
+      <input class="file-input" type="file" id="previousPdf" accept="application/pdf" title="Previous Month File">
+      <button type="button" class="file-picker-btn" onclick="pickFile('previousPdf')">Choose Previous Month File</button>
+      <span class="file-name" id="previousPdfName">No file chosen</span>
+
+      <input class="file-input" type="file" id="currentPdf" accept="application/pdf" title="Current Month File">
+      <button type="button" class="file-picker-btn" onclick="pickFile('currentPdf')">Choose Current Month File</button>
+      <span class="file-name" id="currentPdfName">No file chosen</span>
     </div>
-    <p class="hint">Upload a previous-month PDF and a current-month PDF to generate CSV directly from the bulletin files.</p>
+    <div class="row" style="margin-top: 12px;">
+      <button id="uploadBtn" onclick="uploadPdfs()">Upload</button>
+    </div>
+    <p class="hint">Select Previous Month File in the first picker and Current Month File in the second picker.</p>
 
     <div class="error" id="errorBox"></div>
 
@@ -519,8 +601,7 @@ TEMPLATE = """
             data.prev_label + '  →  ' + data.curr_label;
           resultSection.style.display = 'block';
 
-          // Build and show the ChatGPT prompt
-          const prompt =
+          const prompt = data.prompt ||
             `Generate fb page image for my Facebook page name "U.S. Immigration Hub" include my page name in image for Visa bulletin ${data.curr_label} vs ${data.prev_label} comparison. Refer attached image to follow the same theme and pattern as image attached\n\nHere is the ${data.curr_label} vs ${data.prev_label} data:\n${data.csv}`;
           document.getElementById('promptOutput').value = prompt;
           document.getElementById('promptSection').style.display = 'block';
@@ -573,7 +654,7 @@ TEMPLATE = """
             data.prev_label + '  →  ' + data.curr_label;
           resultSection.style.display = 'block';
 
-          const prompt =
+          const prompt = data.prompt ||
             `Generate fb page image for my Facebook page name "U.S. Immigration Hub" include my page name in image for Visa bulletin ${data.curr_label} vs ${data.prev_label} comparison. Refer attached image to follow the same theme and pattern as image attached\n\nHere is the ${data.curr_label} vs ${data.prev_label} data:\n${data.csv}`;
           document.getElementById('promptOutput').value = prompt;
           document.getElementById('promptSection').style.display = 'block';
@@ -585,6 +666,17 @@ TEMPLATE = """
         btn.disabled = false;
         spinner.style.display = 'none';
       }
+    }
+
+    function pickFile(inputId) {
+      document.getElementById(inputId).click();
+    }
+
+    function setFileName(inputId, labelId) {
+      const input = document.getElementById(inputId);
+      const label = document.getElementById(labelId);
+      const file = input.files && input.files[0];
+      label.textContent = file ? file.name : 'No file chosen';
     }
 
     function copyCSV() {
@@ -612,6 +704,12 @@ TEMPLATE = """
     document.addEventListener('DOMContentLoaded', () => {
       document.getElementById('month').addEventListener('keydown', e => {
         if (e.key === 'Enter') generate();
+      });
+      document.getElementById('previousPdf').addEventListener('change', () => {
+        setFileName('previousPdf', 'previousPdfName');
+      });
+      document.getElementById('currentPdf').addEventListener('change', () => {
+        setFileName('currentPdf', 'currentPdfName');
       });
     });
   </script>
@@ -646,7 +744,7 @@ def generate():
         try:
             previous_pdf = previous_file.read()
             current_pdf = current_file.read()
-            csv_text, prev_label, curr_label, error = generate_csv_from_pdf(
+            csv_text, prev_label, curr_label, error, prompt_text = generate_csv_from_pdf(
                 previous_pdf,
                 current_pdf,
                 previous_filename=previous_file.filename,
@@ -658,7 +756,7 @@ def generate():
         # Handle JSON requests for month-based generation
         body = request.get_json(silent=True) or {}
         month_input = (body.get("month") or "").strip()
-        csv_text, prev_label, curr_label, error = generate_csv(month_input)
+        csv_text, prev_label, curr_label, error, prompt_text = generate_csv(month_input)
 
     if error:
         return jsonify({"error": error}), 400
@@ -667,6 +765,7 @@ def generate():
         "csv":        csv_text,
         "prev_label": prev_label,
         "curr_label": curr_label,
+      "prompt":     prompt_text,
     })
 
 
