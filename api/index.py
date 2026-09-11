@@ -422,10 +422,16 @@ def _parse_pdf_label(pdf_bytes: bytes):
     return None
 
 
+MONTH_NAME_PATTERN = (
+    "January|February|March|April|May|June|July|August|September|October|November|December"
+)
+
+
 def _parse_label_from_filename(filename: str):
     if not filename:
         return None
-    month_match = re.search(r"([A-Za-z]+)[-_ ]+(\d{4})", filename)
+    # Matches both "visabulletin_April2026.pdf" and "visa-bulletin-April-2026.pdf".
+    month_match = re.search(rf"({MONTH_NAME_PATTERN})[-_ ]*(\d{{4}})", filename, re.IGNORECASE)
     if month_match:
         month_name, year = month_match.group(1), month_match.group(2)
         try:
@@ -433,7 +439,7 @@ def _parse_label_from_filename(filename: str):
             return month_dt.strftime("%B %Y")
         except Exception:
             return f"{month_name} {year}"
-    month_only = re.search(r"(January|February|March|April|May|June|July|August|September|October|November|December)", filename, re.IGNORECASE)
+    month_only = re.search(rf"({MONTH_NAME_PATTERN})", filename, re.IGNORECASE)
     if month_only:
         try:
             month_dt = dparser.parse(month_only.group(1))
@@ -514,6 +520,29 @@ def generate_csv_from_pdf(previous_pdf: bytes, current_pdf: bytes, previous_file
         eb_final, eb_filing, eb_sub_final, eb_sub_filing,
         family_final, family_filing, dv_data,
     )
+
+
+def _parse_bulletin_dt(pdf_bytes: bytes, filename: str):
+    label = _parse_pdf_label(pdf_bytes) or _parse_label_from_filename(filename)
+    if not label:
+        return None
+    try:
+        return dparser.parse(label).replace(day=1)
+    except Exception:
+        return None
+
+
+def generate_csv_from_pdf_auto_order(bytes_a: bytes, name_a: str, bytes_b: bytes, name_b: str) -> dict:
+    """Compare two bulletin PDFs, auto-detecting which is earlier (previous)
+    and which is later (current) from each PDF's own content/filename rather
+    than trusting the order they were supplied in."""
+    dt_a = _parse_bulletin_dt(bytes_a, name_a)
+    dt_b = _parse_bulletin_dt(bytes_b, name_b)
+
+    if dt_a is not None and dt_b is not None and dt_a > dt_b:
+        bytes_a, name_a, bytes_b, name_b = bytes_b, name_b, bytes_a, name_a
+
+    return generate_csv_from_pdf(bytes_a, bytes_b, name_a, name_b)
 
 
 def _build_comparison(
@@ -670,6 +699,524 @@ def generate_csv(month_input: str) -> dict:
         eb_final, eb_filing, eb_sub_final, eb_sub_filing,
         family_final, family_filing, dv_data,
     )
+
+
+# ---------------------------------------------------------------------------
+# Future-month projection (trend analysis over the bulletins/ archive)
+# ---------------------------------------------------------------------------
+
+BULLETINS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bulletins")
+
+DEFAULT_LOOKBACK_MONTHS = 6
+
+# Parsed-snapshot cache keyed by (path, mtime, size) so repeated projections do
+# not re-run pdfplumber over the whole archive.
+_SNAPSHOT_CACHE: dict = {}
+
+
+def _snapshot_from_pdf(pdf_bytes: bytes) -> dict:
+    """Extract every comparable table from one bulletin PDF into plain dicts."""
+    eb_final_raw, eb_filing_raw = _find_eb_tables_from_pdf(pdf_bytes)
+    fam_final_raw, fam_filing_raw = _find_family_tables_from_pdf(pdf_bytes)
+    family_keys = [k for k, _ in FAMILY_CATEGORY_MAP]
+
+    to_eb_dict = lambda raw: _table_rows_to_dict(
+        raw, EB_FULL_CATEGORY_KEYS, EB_COUNTRIES, key_normalizer=_normalize_eb_category_key,
+    )
+    return {
+        "eb_final": to_eb_dict(eb_final_raw),
+        "eb_filing": to_eb_dict(eb_filing_raw),
+        "family_final": _table_rows_to_dict(fam_final_raw, family_keys, FAMILY_COUNTRIES),
+        "family_filing": _table_rows_to_dict(fam_filing_raw, family_keys, FAMILY_COUNTRIES),
+        "dv": _dv_rows_to_dict(_find_dv_table_from_pdf(pdf_bytes)),
+    }
+
+
+def _load_bulletin_history() -> list:
+    """Return [(month_datetime, label, snapshot), ...] sorted oldest to newest."""
+    if not os.path.isdir(BULLETINS_DIR):
+        return []
+
+    history = []
+    for filename in sorted(os.listdir(BULLETINS_DIR)):
+        if not filename.lower().endswith(".pdf"):
+            continue
+        path = os.path.join(BULLETINS_DIR, filename)
+        label = _parse_label_from_filename(filename)
+        if not label:
+            continue
+        try:
+            month_dt = dparser.parse(label).replace(day=1)
+        except Exception:
+            continue
+
+        stat = os.stat(path)
+        cache_key = (path, stat.st_mtime, stat.st_size)
+        snapshot = _SNAPSHOT_CACHE.get(cache_key)
+        if snapshot is None:
+            with open(path, "rb") as handle:
+                snapshot = _snapshot_from_pdf(handle.read())
+            _SNAPSHOT_CACHE[cache_key] = snapshot
+
+        history.append((month_dt, month_dt.strftime("%B %Y"), snapshot))
+
+    history.sort(key=lambda item: item[0])
+    return history
+
+
+def _list_bulletin_files() -> list:
+    """Lightweight archive listing (filename + label only, no PDF parsing) for
+    the UI's archive status display."""
+    if not os.path.isdir(BULLETINS_DIR):
+        return []
+    entries = []
+    for filename in sorted(os.listdir(BULLETINS_DIR)):
+        if not filename.lower().endswith(".pdf"):
+            continue
+        label = _parse_label_from_filename(filename)
+        if not label:
+            continue
+        try:
+            month_dt = dparser.parse(label).replace(day=1)
+        except Exception:
+            continue
+        entries.append((month_dt, label, filename))
+    entries.sort(key=lambda item: item[0])
+    return [{"label": label, "filename": filename} for _, label, filename in entries]
+
+
+class BulletinError(Exception):
+    pass
+
+
+class BulletinUploadError(BulletinError):
+    pass
+
+
+class BulletinNotFoundError(BulletinError):
+    pass
+
+
+def save_bulletin_pdf(pdf_bytes: bytes, filename_hint: str = None) -> dict:
+    """Validate and persist an uploaded bulletin PDF into bulletins/ so future
+    projections can trend it. The destination filename is derived entirely
+    from the parsed bulletin month/year (never from the client-supplied name),
+    which keeps the write confined to BULLETINS_DIR."""
+    if not pdf_bytes:
+        raise BulletinUploadError("The uploaded file is empty.")
+    if not pdf_bytes.lstrip().startswith(b"%PDF"):
+        raise BulletinUploadError("The uploaded file does not look like a valid PDF.")
+
+    label = _parse_pdf_label(pdf_bytes) or _parse_label_from_filename(filename_hint)
+    if not label:
+        raise BulletinUploadError(
+            "Could not determine the bulletin's month and year from the PDF or its filename."
+        )
+    try:
+        month_dt = dparser.parse(label).replace(day=1)
+    except Exception:
+        raise BulletinUploadError(f"Could not parse a valid month/year from '{label}'.")
+
+    filename = f"visabulletin_{month_dt.strftime('%B%Y')}.pdf"
+    path = os.path.join(BULLETINS_DIR, filename)
+    os.makedirs(BULLETINS_DIR, exist_ok=True)
+
+    replaced = os.path.exists(path)
+    with open(path, "wb") as handle:
+        handle.write(pdf_bytes)
+
+    return {
+        "label": month_dt.strftime("%B %Y"),
+        "filename": filename,
+        "replaced": replaced,
+        "bulletins": _list_bulletin_files(),
+    }
+
+
+def _read_bulletin_file(filename: str) -> bytes:
+    """Read a bulletin PDF from the archive by filename, validated against the
+    current archive listing so client input can never escape BULLETINS_DIR."""
+    valid_names = {entry["filename"] for entry in _list_bulletin_files()}
+    if filename not in valid_names:
+        raise BulletinNotFoundError(f"'{filename}' was not found in the bulletins archive.")
+    with open(os.path.join(BULLETINS_DIR, filename), "rb") as handle:
+        return handle.read()
+
+
+def generate_csv_from_archive_selection(filename_a: str, filename_b: str) -> dict:
+    """Compare two bulletins already stored in the archive, auto-detecting
+    which is earlier (previous) and which is later (current) by parsed date -
+    the dropdown order the user picked them in doesn't matter."""
+    bytes_a = _read_bulletin_file(filename_a)
+    bytes_b = _read_bulletin_file(filename_b)
+    return generate_csv_from_pdf_auto_order(bytes_a, filename_a, bytes_b, filename_b)
+
+
+def _seasonal_delta_days(history_by_month: dict, snapshot_key: str, cat: str, country: str, latest_dt: datetime, next_dt: datetime):
+    """Return the actual day movement for this category/country during last
+    year's same-season transition (e.g. last year's Sep -> Oct), if both
+    bulletins are in the archive. Used instead of a within-year average when
+    the projection crosses a fiscal-year boundary, since Oct 1 resets annual
+    per-country limits and the recent trend does not carry over."""
+    prev_latest = history_by_month.get((latest_dt.year - 1, latest_dt.month))
+    prev_next = history_by_month.get((next_dt.year - 1, next_dt.month))
+    if not prev_latest or not prev_next:
+        return None
+    old = prev_latest.get(snapshot_key, {}).get(cat, {}).get(country, "")
+    new = prev_next.get(snapshot_key, {}).get(cat, {}).get(country, "")
+    if isinstance(old, datetime) and isinstance(new, datetime):
+        return (new - old).days
+    return None
+
+
+def _downgrade_confidence(confidence: str) -> str:
+    return {"High": "Medium", "Medium": "Low", "Low": "Low"}.get(confidence, "Low")
+
+
+def _project_series(values: list, seasonal_delta=None, crossing_fy: bool = False) -> dict:
+    """Project the next month's value from an ordered list of parsed cut-off
+    dates. Returns latest/projected display values plus trend metadata.
+
+    When crossing_fy is True, prefer seasonal_delta (last year's actual
+    same-season movement) over the recent within-year average, since Oct 1
+    resets annual per-country limits and can produce an atypical jump."""
+    latest = values[-1] if values else ""
+    if latest == "Current":
+        return {"latest": "Current", "projected": "Current", "avg_days": "", "trend": "Current", "confidence": "High", "note": ""}
+
+    dates = [v for v in values if isinstance(v, datetime)]
+    if not dates:
+        return {
+            "latest": to_display(latest), "projected": to_display(latest),
+            "avg_days": "", "trend": "Insufficient data", "confidence": "Low", "note": "",
+        }
+
+    if crossing_fy and seasonal_delta is not None:
+        projected = dates[-1] + relativedelta(days=seasonal_delta)
+        trend = "Forward" if seasonal_delta > 0 else ("Retrogression" if seasonal_delta < 0 else "No Change")
+        return {
+            "latest": to_display(dates[-1]),
+            "projected": to_display(projected),
+            "avg_days": str(seasonal_delta),
+            "trend": trend,
+            "confidence": "Medium",
+            "note": "New fiscal year: based on last year's Sep-to-Oct move, not the recent monthly average.",
+        }
+
+    if len(dates) < 2:
+        return {
+            "latest": to_display(latest), "projected": to_display(latest),
+            "avg_days": "", "trend": "Insufficient data", "confidence": "Low",
+            "note": "New fiscal year: no prior-year data to base a reset estimate on." if crossing_fy else "",
+        }
+
+    deltas = [(dates[i] - dates[i - 1]).days for i in range(1, len(dates))]
+    avg_days = sum(deltas) / len(deltas)
+    projected = dates[-1] + relativedelta(days=int(round(avg_days)))
+
+    if avg_days > 0.5:
+        trend = "Forward"
+    elif avg_days < -0.5:
+        trend = "Retrogression"
+    else:
+        trend = "No Change"
+
+    forward = sum(1 for d in deltas if d > 0)
+    backward = sum(1 for d in deltas if d < 0)
+    dominant = max(forward, backward, len(deltas) - forward - backward)
+    consistency = dominant / len(deltas)
+    if len(deltas) >= 4 and consistency >= 0.75:
+        confidence = "High"
+    elif len(deltas) >= 2 and consistency >= 0.5:
+        confidence = "Medium"
+    else:
+        confidence = "Low"
+
+    note = ""
+    if crossing_fy:
+        confidence = _downgrade_confidence(confidence)
+        note = "New fiscal year: annual per-country limits reset Oct 1, so the actual move may differ from the recent trend."
+
+    return {
+        "latest": to_display(dates[-1]),
+        "projected": to_display(projected),
+        "avg_days": str(int(round(avg_days))),
+        "trend": trend,
+        "confidence": confidence,
+        "note": note,
+    }
+
+
+def _project_category_table(
+  history: list, snapshot_key: str, category_keys, countries,
+  history_by_month: dict = None, crossing_fy: bool = False, latest_dt: datetime = None, next_dt: datetime = None,
+) -> dict:
+    """Build {category_key: {country: projection}} for one bulletin table."""
+    result = {}
+    for cat in category_keys:
+        result[cat] = {}
+        for country in countries:
+            series = []
+            for _, _, snapshot in history:
+                value = snapshot.get(snapshot_key, {}).get(cat, {}).get(country, "")
+                if value != "":
+                    series.append(value)
+            seasonal_delta = (
+                _seasonal_delta_days(history_by_month, snapshot_key, cat, country, latest_dt, next_dt)
+                if crossing_fy and history_by_month else None
+            )
+            result[cat][country] = _project_series(series, seasonal_delta, crossing_fy)
+    return result
+
+
+def _build_projection_csv(
+  latest_label: str, next_label: str, final: dict, filing: dict, category_map, countries,
+) -> str:
+    lines = [
+        f"Table,Category,Country,{latest_label} (Actual),"
+        f"AvgMonthlyMovementDays,{next_label} (Projected),Trend,Confidence,Note"
+    ]
+    for tbl_label, data_dict in [("Final Action Dates", final), ("Dates for Filing", filing)]:
+        if not data_dict:
+            continue
+        for cat_key, label in category_map:
+            for country in countries:
+                item = data_dict.get(cat_key, {}).get(country)
+                if not item:
+                    continue
+                lines.append(
+                    f"{tbl_label},{label},{country},{item['latest']},"
+                    f"{item['avg_days']},{item['projected']},{item['trend']},{item['confidence']},"
+                    f"{_csv_field(item.get('note', ''))}"
+                )
+    return "\n".join(lines)
+
+
+def _build_projection_prompt(
+  latest_label: str, next_label: str, csv_text: str, subtitle: str, months_used: int, crossing_fy: bool = False,
+) -> str:
+    fy_note = (
+        "Note: this projection crosses into a new fiscal year (Oct 1) when annual per-country limits reset, "
+        "so some categories use last year's actual Sep-to-Oct move instead of the recent trend.\n"
+        if crossing_fy else ""
+    )
+    return (
+        "Create a high-quality Facebook infographic in the same visual style as my sample image for page name \"U.S. Immigration Hub\".\n"
+        f"Title: VISA BULLETIN FORECAST - {next_label.upper()}\n"
+        f"Subtitle: {subtitle}\n\n"
+        f"This is a PROJECTION based on the trend across the last {months_used} published bulletins "
+        f"(latest actual bulletin: {latest_label}).\n"
+        f"{fy_note}"
+        "Build two side-by-side sections: FINAL ACTION DATES and DATES FOR FILING.\n"
+        "For each table, include columns: Category, Country, Latest Actual Date, Avg Monthly Movement, Projected Date, Confidence.\n"
+        "Use arrows and color coding: green up arrow for projected forward movement, red down arrow for projected retrogression, neutral for no change.\n"
+        "Show a clear disclaimer banner: \"Projection only - not an official Department of State forecast.\"\n"
+        "Keep branding prominent with U.S. Immigration Hub text and a professional immigration-news look.\n\n"
+        "Use this exact data:\n"
+        f"{csv_text}"
+    )
+
+
+def _fiscal_year(dt: datetime) -> int:
+    """US federal fiscal year: October starts the next fiscal year."""
+    return dt.year + 1 if dt.month >= 10 else dt.year
+
+
+def _project_dv(history: list, history_by_month: dict = None, crossing_fy: bool = False, next_dt: datetime = None) -> dict:
+    """Project the next month's DV allocation per region using the numeric part
+    of each allocation string. Allocations reset each October, so only months in
+    the latest bulletin's fiscal year are trended. When the projection target
+    itself crosses into a new fiscal year, extrapolating that within-year growth
+    would be wrong (DV restarts low each October) - use last year's actual
+    value for the target month instead, if the archive has it."""
+    latest_fy = _fiscal_year(history[-1][0])
+    history = [entry for entry in history if _fiscal_year(entry[0]) == latest_fy]
+
+    result = {}
+    regions = []
+    for _, _, snapshot in history:
+        for region in snapshot.get("dv", {}):
+            if region not in regions:
+                regions.append(region)
+
+    for region in regions:
+        numbers = []
+        latest_raw = ""
+        for _, _, snapshot in history:
+            raw = snapshot.get("dv", {}).get(region, "")
+            if not raw:
+                continue
+            latest_raw = raw
+            match = re.search(r"([\d,]+)", raw)
+            if match:
+                numbers.append(int(match.group(1).replace(",", "")))
+
+        if crossing_fy and history_by_month and next_dt is not None:
+            prior_year_next = history_by_month.get((next_dt.year - 1, next_dt.month))
+            prior_raw = prior_year_next.get("dv", {}).get(region, "") if prior_year_next else ""
+            if prior_raw:
+                result[region] = {
+                    "latest": latest_raw or "N/A",
+                    "projected": prior_raw,
+                    "avg_change": "",
+                    "trend": "Reset (new fiscal year)",
+                    "confidence": "Medium",
+                    "note": "New fiscal year: projected from last year's same month, since DV allocations restart each Oct 1.",
+                }
+                continue
+
+        if len(numbers) < 2:
+            result[region] = {
+                "latest": latest_raw or "N/A", "projected": latest_raw or "N/A",
+                "avg_change": "", "trend": "Insufficient data", "confidence": "Low",
+                "note": "New fiscal year: no prior-year data to base a reset estimate on." if crossing_fy else "",
+            }
+            continue
+
+        if not re.search(r"\d", latest_raw):
+            # e.g. a region already marked "Current" - nothing numeric to project.
+            result[region] = {
+                "latest": latest_raw, "projected": latest_raw,
+                "avg_change": "", "trend": "Flat", "confidence": "High", "note": "",
+            }
+            continue
+
+        deltas = [numbers[i] - numbers[i - 1] for i in range(1, len(numbers))]
+        avg_change = sum(deltas) / len(deltas)
+        projected_value = max(0, int(round(numbers[-1] + avg_change)))
+        prefix = re.sub(r"[\d,]+.*$", "", latest_raw).strip()
+        confidence = "High" if len(deltas) >= 4 else "Medium"
+        note = ""
+        if crossing_fy:
+            confidence = _downgrade_confidence(confidence)
+            note = "New fiscal year: no prior-year figure found for this region; extrapolated within-year growth instead, which likely overstates the actual reset."
+        result[region] = {
+            "latest": latest_raw,
+            "projected": f"{prefix} {projected_value:,}".strip(),
+            "avg_change": str(int(round(avg_change))),
+            "trend": "Increasing" if avg_change > 0 else ("Decreasing" if avg_change < 0 else "Flat"),
+            "confidence": confidence,
+            "note": note,
+        }
+    return result
+
+
+def _build_dv_projection_csv(latest_label: str, next_label: str, dv_data: dict) -> str:
+    lines = [
+        f"Category,Region,{latest_label} (Actual),AvgMonthlyChange,"
+        f"{next_label} (Projected),Trend,Confidence,Note"
+    ]
+    for region, item in dv_data.items():
+        lines.append(
+            f"Diversity Visa,{_csv_field(region)},{_csv_field(item['latest'])},"
+            f"{item['avg_change']},{_csv_field(item['projected'])},{item['trend']},{item['confidence']},"
+            f"{_csv_field(item.get('note', ''))}"
+        )
+    return "\n".join(lines)
+
+
+def _build_dv_projection_prompt(latest_label: str, next_label: str, csv_text: str, months_used: int, crossing_fy: bool = False) -> str:
+    fy_note = (
+        "Note: DV allocations reset every Oct 1 (new fiscal year), so where last year's same-month figure was "
+        "available it was used directly instead of extrapolating this year's growth.\n"
+        if crossing_fy else ""
+    )
+    return (
+        "Create a high-quality Facebook infographic in the same visual style as my sample image for page name \"U.S. Immigration Hub\".\n"
+        f"Title: VISA BULLETIN FORECAST - {next_label.upper()}\n"
+        "Subtitle: DIVERSITY VISA (DV) LOTTERY REGIONAL ALLOCATIONS - PROJECTED\n\n"
+        f"This is a PROJECTION based on the trend across the last {months_used} published bulletins "
+        f"(latest actual bulletin: {latest_label}).\n"
+        f"{fy_note}"
+        "Build one table with columns: Region, Latest Actual Allocation, Avg Monthly Change, Projected Allocation, Confidence.\n"
+        "Use color coding: green for regions projected to increase, red for a projected decrease, neutral for flat.\n"
+        "Show a clear disclaimer banner: \"Projection only - not an official Department of State forecast.\"\n"
+        "Keep branding prominent with U.S. Immigration Hub text and a professional immigration-news look.\n\n"
+        "Use this exact data:\n"
+        f"{csv_text}"
+    )
+
+
+def _projection_error(error: str) -> dict:
+    return {
+        "csv": "", "prompt": "",
+        "eb_sub_csv": "", "eb_sub_prompt": "",
+        "family_csv": "", "family_prompt": "",
+        "dv_csv": "", "dv_prompt": "",
+        "latest_label": "", "next_label": "", "months_used": 0,
+        "months_trended": [], "months_available": [], "crosses_fiscal_year": False,
+        "error": error,
+    }
+
+
+def generate_projection(lookback_months: int = DEFAULT_LOOKBACK_MONTHS) -> dict:
+    """Project the next (unpublished) month for every category from the trend
+    across the bulletin PDFs stored in bulletins/."""
+    full_history = _load_bulletin_history()
+    if len(full_history) < 2:
+        return _projection_error(
+            "Need at least two bulletin PDFs in the bulletins/ folder to project a future month."
+        )
+
+    lookback_months = max(2, min(lookback_months, len(full_history)))
+    history = full_history[-lookback_months:]
+
+    latest_dt, latest_label, _ = history[-1]
+    next_dt = latest_dt + relativedelta(months=1)
+    next_label = next_dt.strftime("%B %Y")
+    months_used = len(history)
+
+    # Oct 1 starts a new fiscal year: annual per-country limits reset and DV
+    # allocations restart low, so a plain within-year average can mislead.
+    # Use the full (unrestricted) archive to look up last year's actual
+    # same-season transition as a better basis for the projection.
+    crossing_fy = _fiscal_year(next_dt) != _fiscal_year(latest_dt)
+    history_by_month = {(dt.year, dt.month): snapshot for dt, _, snapshot in full_history}
+
+    fy_kwargs = dict(history_by_month=history_by_month, crossing_fy=crossing_fy, latest_dt=latest_dt, next_dt=next_dt)
+
+    eb_final = _project_category_table(history, "eb_final", ("1st", "2nd", "3rd"), EB_COUNTRIES, **fy_kwargs)
+    eb_filing = _project_category_table(history, "eb_filing", ("1st", "2nd", "3rd"), EB_COUNTRIES, **fy_kwargs)
+    eb_sub_final = _project_category_table(history, "eb_final", EB_SUB_CATEGORY_KEYS, EB_COUNTRIES, **fy_kwargs)
+    eb_sub_filing = _project_category_table(history, "eb_filing", EB_SUB_CATEGORY_KEYS, EB_COUNTRIES, **fy_kwargs)
+
+    family_keys = [k for k, _ in FAMILY_CATEGORY_MAP]
+    family_final = _project_category_table(history, "family_final", family_keys, FAMILY_COUNTRIES, **fy_kwargs)
+    family_filing = _project_category_table(history, "family_filing", family_keys, FAMILY_COUNTRIES, **fy_kwargs)
+
+    dv_data = _project_dv(history, history_by_month=history_by_month, crossing_fy=crossing_fy, next_dt=next_dt)
+
+    eb_csv = _build_projection_csv(latest_label, next_label, eb_final, eb_filing, EB_CATEGORY_MAP, EB_COUNTRIES)
+    eb_sub_csv = _build_projection_csv(latest_label, next_label, eb_sub_final, eb_sub_filing, EB_SUB_CATEGORY_MAP, EB_COUNTRIES)
+    family_csv = _build_projection_csv(latest_label, next_label, family_final, family_filing, FAMILY_CATEGORY_MAP, FAMILY_COUNTRIES)
+    dv_csv = _build_dv_projection_csv(latest_label, next_label, dv_data)
+
+    return {
+        "csv": eb_csv,
+        "prompt": _build_projection_prompt(
+            latest_label, next_label, eb_csv,
+            "EMPLOYMENT-BASED PREFERENCES (EB-1, EB-2 & EB-3)", months_used, crossing_fy,
+        ),
+        "eb_sub_csv": eb_sub_csv,
+        "eb_sub_prompt": _build_projection_prompt(
+            latest_label, next_label, eb_sub_csv,
+            "EMPLOYMENT-BASED: EB-4, OTHER WORKERS, RELIGIOUS WORKERS & EB-5", months_used, crossing_fy,
+        ),
+        "family_csv": family_csv,
+        "family_prompt": _build_projection_prompt(
+            latest_label, next_label, family_csv,
+            "FAMILY-SPONSORED PREFERENCES (F1, F2A, F2B, F3 & F4)", months_used, crossing_fy,
+        ),
+        "dv_csv": dv_csv,
+        "dv_prompt": _build_dv_projection_prompt(latest_label, next_label, dv_csv, months_used, crossing_fy),
+        "latest_label": latest_label,
+        "next_label": next_label,
+        "months_used": months_used,
+        "months_trended": [label for _, label, _ in history],
+        "months_available": [label for _, label, _ in full_history],
+        "crosses_fiscal_year": crossing_fy,
+        "error": "",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -833,59 +1380,237 @@ TEMPLATE = """
       resize: vertical;
     }
     .prompt-ta:focus { outline: none; border-color: #ffd700; }
+
+    #homeView { display: flex; flex-direction: column; align-items: center; }
+    .nav-cards { display: flex; gap: 20px; flex-wrap: wrap; justify-content: center; margin-top: 16px; }
+    .nav-card {
+      background: #132840;
+      border: 1px solid #1e3a5f;
+      border-radius: 10px;
+      padding: 28px 24px;
+      width: 240px;
+      text-align: left;
+      cursor: pointer;
+      color: #e0e0e0;
+      white-space: normal;
+      font-weight: 400;
+    }
+    .nav-card:hover { border-color: #ffd700; background: #17304f; }
+    .nav-card-icon {
+      width: 44px;
+      height: 44px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(255, 215, 0, 0.12);
+      border-radius: 10px;
+      color: #ffd700;
+      margin-bottom: 14px;
+    }
+    .nav-card-icon svg { width: 24px; height: 24px; }
+    .nav-card-title { color: #ffd700; font-size: 1.05rem; font-weight: 700; margin-bottom: 6px; }
+    .nav-card-desc { font-size: 0.82rem; color: #aaa; line-height: 1.4; font-weight: 400; }
+
+    .view { width: 100%; max-width: 680px; display: flex; flex-direction: column; align-items: center; }
+    .view-header { display: flex; align-items: flex-start; gap: 14px; margin-bottom: 16px; width: 100%; }
+    .back-btn { background: transparent; color: #ffd700; border: 1px solid #2a5080; padding: 8px 14px; font-size: 0.85rem; font-weight: 600; }
+    .back-btn:hover { background: #17304f; }
+    .view-header h1 { font-size: 1.5rem; margin: 0 0 2px; }
+    .view-header p.sub { margin: 0; }
+
+    select {
+      flex: 1;
+      min-width: 200px;
+      padding: 10px 14px;
+      background: #0b1f3a;
+      border: 1px solid #2a4a6a;
+      border-radius: 6px;
+      color: #fff;
+      font-size: 0.95rem;
+    }
+    select:focus { outline: none; border-color: #ffd700; }
+
+    .bulletins-table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+    .bulletins-table th, .bulletins-table td {
+      text-align: left; padding: 8px 10px; border-bottom: 1px solid #1e3a5f; font-size: 0.85rem;
+    }
+    .bulletins-table th { color: #8ee6a0; font-size: 0.78rem; text-transform: uppercase; letter-spacing: .04em; }
   </style>
 </head>
 <body>
-  <h1>Visa Bulletin Tracker</h1>
-  <p class="sub">Employment-Based, Family-Sponsored &amp; Diversity Visa — month-over-month comparison</p>
-
-  <div class="card">
-    <label for="month">Month (leave blank to auto-detect)</label>
-    <div class="row">
-      <input type="text" id="month" placeholder="e.g. july, august, may …">
-      <button id="generateBtn" onclick="generate()">Generate CSV</button>
-      <span class="spinner" id="spinner">⏳ Loading…</span>
-    </div>
-    <p class="hint">Compares the entered month against the previous month. Blank = uses today's month as previous, next month as current.</p>
-    <hr />
-    <label>Upload Visa Bulletin PDF files (order matters)</label>
-    <div class="file-row">
-      <input class="file-input" type="file" id="previousPdf" accept="application/pdf" title="Previous Month File">
-      <button type="button" class="file-picker-btn" onclick="pickFile('previousPdf')">Choose Previous Month File</button>
-      <span class="file-name" id="previousPdfName">No file chosen</span>
-
-      <input class="file-input" type="file" id="currentPdf" accept="application/pdf" title="Current Month File">
-      <button type="button" class="file-picker-btn" onclick="pickFile('currentPdf')">Choose Current Month File</button>
-      <span class="file-name" id="currentPdfName">No file chosen</span>
-    </div>
-    <div class="row" style="margin-top: 12px;">
-      <button id="uploadBtn" onclick="uploadPdfs()">Upload</button>
-    </div>
-    <p class="hint">Select Previous Month File in the first picker and Current Month File in the second picker.</p>
-
-    <div class="error" id="errorBox"></div>
-
-    <template id="categorySectionTemplate">
-      <div class="result-section">
-        <div class="result-header">
-          <span class="result-label"></span>
-          <button class="copy-btn" data-copy="csv">Copy CSV</button>
+  <div id="homeView" style="display:flex;">
+    <h1>Visa Bulletin Tracker</h1>
+    <p class="sub">Choose what you'd like to do</p>
+    <div class="nav-cards">
+      <button class="nav-card" onclick="navigateTo('compare')">
+        <div class="nav-card-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"></line><line x1="12" y1="20" x2="12" y2="4"></line><line x1="6" y1="20" x2="6" y2="14"></line></svg>
         </div>
-        <textarea class="csv-output" readonly></textarea>
-      </div>
-      <div class="prompt-section">
-        <div class="section-title">
-          <span class="section-title-label">Copy Prompt</span>
-          <button class="copy-btn" data-copy="prompt">Copy Prompt</button>
+        <div class="nav-card-title">Month Comparison</div>
+        <div class="nav-card-desc">Compare two bulletins, current vs previous. Pick from the archive or upload — we auto-detect which is earlier.</div>
+      </button>
+      <button class="nav-card" onclick="navigateTo('predict')">
+        <div class="nav-card-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"></polyline><polyline points="17 6 23 6 23 12"></polyline></svg>
         </div>
-        <textarea class="prompt-ta prompt-output" readonly></textarea>
+        <div class="nav-card-title">Future Prediction</div>
+        <div class="nav-card-desc">Forecast the next unpublished month by trending the bulletin archive.</div>
+      </button>
+      <button class="nav-card" onclick="navigateTo('admin')">
+        <div class="nav-card-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
+        </div>
+        <div class="nav-card-title">Admin / Uploads</div>
+        <div class="nav-card-desc">Upload bulletin PDFs and see everything currently stored in the archive.</div>
+      </button>
+    </div>
+  </div>
+
+  <div id="compareView" class="view" style="display:none;">
+    <div class="view-header">
+      <button class="back-btn" onclick="navigateTo('home')">← Back</button>
+      <div>
+        <h1>Month Comparison</h1>
+        <p class="sub">Employment-Based, Family-Sponsored &amp; Diversity Visa — pick any two bulletins</p>
       </div>
-    </template>
+    </div>
+
+    <div class="card">
+      <label>Bulletin 1</label>
+      <div class="file-row">
+        <select id="bulletinASelect" onchange="onBulletinSelectChange('A')"></select>
+      </div>
+      <input class="file-input" type="file" id="bulletinAUpload" accept="application/pdf">
+
+      <label style="margin-top:16px;">Bulletin 2</label>
+      <div class="file-row">
+        <select id="bulletinBSelect" onchange="onBulletinSelectChange('B')"></select>
+      </div>
+      <input class="file-input" type="file" id="bulletinBUpload" accept="application/pdf">
+
+      <div class="row" style="margin-top: 16px;">
+        <button id="compareBtn" onclick="runComparison()">Compare</button>
+        <span class="spinner" id="compareSpinner">⏳ Loading…</span>
+      </div>
+      <p class="hint">We automatically detect which bulletin is earlier (previous) and which is later (current) — selection order doesn't matter.</p>
+
+      <details style="margin-top: 16px;">
+        <summary style="cursor:pointer; color:#8ee6a0; font-size:0.9rem;">Advanced: fetch by month name (scrapes travel.state.gov)</summary>
+        <div class="row" style="margin-top: 12px;">
+          <input type="text" id="month" placeholder="e.g. july, august, may …">
+          <button id="generateBtn" onclick="generate()">Generate CSV</button>
+          <span class="spinner" id="spinner">⏳ Loading…</span>
+        </div>
+        <p class="hint">Compares the entered month against the previous month. Blank = uses today's month as previous, next month as current.</p>
+      </details>
+
+      <div class="error" id="errorBox"></div>
+
+      <template id="categorySectionTemplate">
+        <div class="result-section">
+          <div class="result-header">
+            <span class="result-label"></span>
+            <button class="copy-btn" data-copy="csv">Copy CSV</button>
+          </div>
+          <textarea class="csv-output" readonly></textarea>
+        </div>
+        <div class="prompt-section">
+          <div class="section-title">
+            <span class="section-title-label">Copy Prompt</span>
+            <button class="copy-btn" data-copy="prompt">Copy Prompt</button>
+          </div>
+          <textarea class="prompt-ta prompt-output" readonly></textarea>
+        </div>
+      </template>
+
 
     <div id="ebSection" data-title="Employment-Based (EB1, EB2 &amp; EB3)"></div>
     <div id="ebSubSection" data-title="Employment-Based: EB-4, Other Workers, Religious Workers &amp; EB-5"></div>
     <div id="familySection" data-title="Family-Sponsored (F1, F2A, F2B, F3 &amp; F4)"></div>
     <div id="dvSection" data-title="Diversity Visa (DV)"></div>
+    </div>
+  </div>
+
+  <div id="predictView" class="view" style="display:none;">
+    <div class="view-header">
+      <button class="back-btn" onclick="navigateTo('home')">← Back</button>
+      <div>
+        <h1>Future Prediction</h1>
+        <p class="sub">Forecast the next unpublished month by trending the bulletin archive</p>
+      </div>
+    </div>
+
+    <div class="card">
+    <p class="hint" style="margin-top:0;">
+      Forecasts the next (unpublished) month for every category by trending the bulletin PDFs
+      stored in the <code>bulletins/</code> folder. Projection only — not an official forecast.
+    </p>
+
+    <label>Add a bulletin PDF to the archive</label>
+    <div class="file-row">
+      <input class="file-input" type="file" id="predictUploadFile" accept="application/pdf" title="Bulletin PDF">
+      <button type="button" class="file-picker-btn" onclick="pickFile('predictUploadFile')">Choose Bulletin PDF</button>
+      <span class="file-name" id="predictUploadFileName">No file chosen</span>
+      <button id="predictUploadBtn" onclick="handleWidgetUpload('predictUploadFile', 'predictUploadFileName', 'predictUploadErrorBox')">Save to Archive</button>
+      <span class="spinner" id="predictUploadSpinner">⏳ Saving…</span>
+    </div>
+    <p class="hint">The month/year is read from the PDF itself, so it's saved with the right filename automatically.</p>
+    <div class="error" id="predictUploadErrorBox"></div>
+    <p class="hint" id="archiveStatus"></p>
+
+    <hr />
+    <div class="row">
+      <div style="flex:1; min-width:160px;">
+        <label for="lookback">Months of history to trend</label>
+        <input type="text" id="lookback" value="6" placeholder="e.g. 6">
+      </div>
+      <button id="projectBtn" onclick="projectFuture()">Generate Projection</button>
+      <span class="spinner" id="projectSpinner">⏳ Loading…</span>
+    </div>
+    <p class="hint" id="projectMeta"></p>
+    <div class="error" id="fyBanner" style="background:#3a2d15; border-color:#a07a30; color:#ffcf7a; display:none;">
+      ⚠️ This projection crosses into a new fiscal year (Oct 1) — annual per-country limits reset and DV
+      allocations restart low, so some categories below use last year's actual Sep→Oct move instead of the
+      recent monthly average. Check each row's Note column and treat these projections as lower confidence.
+    </div>
+
+    <div class="error" id="projectErrorBox"></div>
+
+    <div id="projEbSection"></div>
+    <div id="projEbSubSection"></div>
+    <div id="projFamilySection"></div>
+    <div id="projDvSection"></div>
+    </div>
+  </div>
+
+  <div id="adminView" class="view" style="display:none;">
+    <div class="view-header">
+      <button class="back-btn" onclick="navigateTo('home')">← Back</button>
+      <div>
+        <h1>Admin / Uploads</h1>
+        <p class="sub">Upload bulletin PDFs and manage the archive</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <label>Upload a bulletin PDF</label>
+      <div class="file-row">
+        <input class="file-input" type="file" id="adminUploadFile" accept="application/pdf" title="Bulletin PDF">
+        <button type="button" class="file-picker-btn" onclick="pickFile('adminUploadFile')">Choose Bulletin PDF</button>
+        <span class="file-name" id="adminUploadFileName">No file chosen</span>
+        <button id="adminUploadBtn" onclick="handleWidgetUpload('adminUploadFile', 'adminUploadFileName', 'adminUploadErrorBox')">Save to Archive</button>
+        <span class="spinner" id="adminUploadSpinner">⏳ Saving…</span>
+      </div>
+      <p class="hint">The month/year is read from the PDF itself, so it's saved with the right filename automatically.</p>
+      <div class="error" id="adminUploadErrorBox"></div>
+
+      <h2 style="color:#8ee6a0; font-size:1rem; margin-top:24px; margin-bottom:0;">Archived Bulletins</h2>
+      <table class="bulletins-table">
+        <thead><tr><th>Month</th><th>Filename</th></tr></thead>
+        <tbody id="bulletinsTableBody"></tbody>
+      </table>
+      <p class="hint" id="adminEmptyHint" style="display:none;">No bulletins uploaded yet.</p>
+    </div>
   </div>
 
   <script>
@@ -896,9 +1621,15 @@ TEMPLATE = """
       { key: 'dv', title: 'Diversity Visa (DV)', csvField: 'dv_csv', promptField: 'dv_prompt' },
     ];
 
-    function buildCategorySections() {
+    const PROJECTION_CATEGORIES = CATEGORIES.map(cat => ({
+      ...cat,
+      key: 'proj' + cat.key.charAt(0).toUpperCase() + cat.key.slice(1),
+      title: 'Projected — ' + cat.title,
+    }));
+
+    function buildCategorySections(categories) {
       const tpl = document.getElementById('categorySectionTemplate');
-      CATEGORIES.forEach(cat => {
+      categories.forEach(cat => {
         const container = document.getElementById(cat.key + 'Section');
         const heading = document.createElement('h3');
         heading.textContent = cat.title;
@@ -913,15 +1644,14 @@ TEMPLATE = """
       });
     }
 
-    function renderCategory(cat, data) {
+    function renderCategory(cat, data, labelText) {
       const container = document.getElementById(cat.key + 'Section');
       const resultSection = container.querySelector('.result-section');
       const promptSection = container.querySelector('.prompt-section');
       const csv = data[cat.csvField] || '';
       const prompt = data[cat.promptField] || '';
 
-      container.querySelector('.result-label').textContent =
-        data.prev_label + '  →  ' + data.curr_label;
+      container.querySelector('.result-label').textContent = labelText;
       container.querySelector('.csv-output').value = csv;
       container.querySelector('.prompt-output').value = prompt;
 
@@ -930,13 +1660,30 @@ TEMPLATE = """
     }
 
     function renderAllCategories(data) {
-      CATEGORIES.forEach(cat => renderCategory(cat, data));
+      const labelText = data.prev_label + '  →  ' + data.curr_label;
+      CATEGORIES.forEach(cat => renderCategory(cat, data, labelText));
+    }
+
+    function renderProjection(data) {
+      const labelText = data.latest_label + ' (actual)  →  ' + data.next_label + ' (projected)';
+      PROJECTION_CATEGORIES.forEach(cat => renderCategory(cat, data, labelText));
+      document.getElementById('projectMeta').textContent =
+        `Trended over ${data.months_used} bulletin(s): ${data.months_trended.join(', ')}`
+        + ` — ${data.months_available.length} bulletin(s) available in bulletins/.`;
+      document.getElementById('fyBanner').style.display = data.crosses_fiscal_year ? 'block' : 'none';
+    }
+
+    function hideCategories(categories) {
+      categories.forEach(cat => {
+        document
+          .getElementById(cat.key + 'Section')
+          .querySelectorAll('.result-section, .prompt-section')
+          .forEach(el => { el.style.display = 'none'; });
+      });
     }
 
     function hideAllCategories() {
-      document.querySelectorAll('.result-section, .prompt-section').forEach(el => {
-        el.style.display = 'none';
-      });
+      hideCategories(CATEGORIES);
     }
 
     async function generate() {
@@ -973,15 +1720,237 @@ TEMPLATE = """
       }
     }
 
-    async function uploadPdfs() {
-      const prev = document.getElementById('previousPdf').files[0];
-      const curr = document.getElementById('currentPdf').files[0];
-      const btn = document.getElementById('uploadBtn');
-      const spinner = document.getElementById('spinner');
+    function pickFile(inputId) {
+      document.getElementById(inputId).click();
+    }
+
+    async function projectFuture() {
+      const btn = document.getElementById('projectBtn');
+      const spinner = document.getElementById('projectSpinner');
+      const errorBox = document.getElementById('projectErrorBox');
+      const lookback = parseInt(document.getElementById('lookback').value, 10) || 6;
+
+      btn.disabled = true;
+      spinner.style.display = 'inline';
+      errorBox.style.display = 'none';
+      document.getElementById('projectMeta').textContent = '';
+      document.getElementById('fyBanner').style.display = 'none';
+      hideCategories(PROJECTION_CATEGORIES);
+
+      try {
+        const resp = await fetch('/project', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ lookback })
+        });
+        const data = await resp.json();
+
+        if (data.error) {
+          errorBox.textContent = data.error;
+          errorBox.style.display = 'block';
+        } else {
+          renderProjection(data);
+        }
+      } catch (err) {
+        errorBox.textContent = 'Request failed: ' + err.message;
+        errorBox.style.display = 'block';
+      } finally {
+        btn.disabled = false;
+        spinner.style.display = 'none';
+      }
+    }
+
+    function setFileName(inputId, labelId) {
+      const input = document.getElementById(inputId);
+      const label = document.getElementById(labelId);
+      const file = input.files && input.files[0];
+      label.textContent = file ? file.name : 'No file chosen';
+    }
+
+    // ---- Archive helpers shared by the Compare / Predict / Admin views ----
+
+    async function uploadBulletinFile(file) {
+      const formData = new FormData();
+      formData.append('bulletin_pdf', file);
+      const resp = await fetch('/bulletins/upload', { method: 'POST', body: formData });
+      const data = await resp.json();
+      if (data.error) throw new Error(data.error);
+      return data;
+    }
+
+    function renderArchiveStatus(bulletins) {
+      const el = document.getElementById('archiveStatus');
+      if (!el) return;
+      const months = bulletins.map(b => b.label);
+      el.textContent = months.length
+        ? `Archive has ${months.length} bulletin(s): ${months.join(', ')}`
+        : 'Archive is empty — upload a bulletin PDF to get started.';
+    }
+
+    function renderBulletinsTable(bulletins) {
+      const tbody = document.getElementById('bulletinsTableBody');
+      const emptyHint = document.getElementById('adminEmptyHint');
+      if (!tbody) return;
+      tbody.innerHTML = '';
+      if (!bulletins.length) {
+        emptyHint.style.display = 'block';
+        return;
+      }
+      emptyHint.style.display = 'none';
+      bulletins.forEach(b => {
+        const tr = document.createElement('tr');
+        const tdLabel = document.createElement('td');
+        tdLabel.textContent = b.label;
+        const tdFile = document.createElement('td');
+        tdFile.textContent = b.filename;
+        tr.appendChild(tdLabel);
+        tr.appendChild(tdFile);
+        tbody.appendChild(tr);
+      });
+    }
+
+    function populateBulletinSelect(selectEl, bulletins, preferredValue) {
+      selectEl.innerHTML = '';
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = bulletins.length ? 'Select a bulletin…' : 'No bulletins yet — upload one below';
+      placeholder.disabled = true;
+      selectEl.appendChild(placeholder);
+
+      bulletins.forEach(b => {
+        const opt = document.createElement('option');
+        opt.value = b.filename;
+        opt.textContent = b.label;
+        selectEl.appendChild(opt);
+      });
+
+      const uploadOpt = document.createElement('option');
+      uploadOpt.value = '__upload__';
+      uploadOpt.textContent = '+ Upload a new bulletin PDF…';
+      selectEl.appendChild(uploadOpt);
+
+      const hasPreferred = preferredValue && bulletins.some(b => b.filename === preferredValue);
+      selectEl.value = hasPreferred ? preferredValue : '';
+      selectEl.dataset.lastValid = selectEl.value;
+    }
+
+    function syncArchiveEverywhere(bulletins) {
+      ['A', 'B'].forEach(slot => {
+        const select = document.getElementById('bulletin' + slot + 'Select');
+        if (select) populateBulletinSelect(select, bulletins, select.dataset.lastValid);
+      });
+      renderArchiveStatus(bulletins);
+      renderBulletinsTable(bulletins);
+    }
+
+    async function fetchArchive() {
+      try {
+        const resp = await fetch('/bulletins');
+        const data = await resp.json();
+        const bulletins = data.bulletins || [];
+        const selectA = document.getElementById('bulletinASelect');
+        const selectB = document.getElementById('bulletinBSelect');
+
+        let preferredA = selectA.dataset.lastValid;
+        let preferredB = selectB.dataset.lastValid;
+        if (!selectA.dataset.initialized) {
+          // Default to the two most recently archived bulletins — the usual
+          // "new bulletin just arrived" comparison.
+          selectA.dataset.initialized = '1';
+          if (bulletins.length >= 2) {
+            preferredA = bulletins[bulletins.length - 2].filename;
+            preferredB = bulletins[bulletins.length - 1].filename;
+          } else if (bulletins.length === 1) {
+            preferredA = bulletins[0].filename;
+          }
+        }
+
+        populateBulletinSelect(selectA, bulletins, preferredA);
+        populateBulletinSelect(selectB, bulletins, preferredB);
+        renderArchiveStatus(bulletins);
+        renderBulletinsTable(bulletins);
+      } catch (err) {
+        // Non-fatal: leave existing UI state if this fails.
+      }
+    }
+
+    function onBulletinSelectChange(slot) {
+      const select = document.getElementById('bulletin' + slot + 'Select');
+      if (select.value === '__upload__') {
+        const revertTo = select.dataset.lastValid || '';
+        document.getElementById('bulletin' + slot + 'Upload').click();
+        select.value = revertTo;
+      } else {
+        select.dataset.lastValid = select.value;
+      }
+    }
+
+    async function handleInlineUpload(slot) {
+      const fileInput = document.getElementById('bulletin' + slot + 'Upload');
+      const select = document.getElementById('bulletin' + slot + 'Select');
+      const errorBox = document.getElementById('errorBox');
+      const file = fileInput.files[0];
+      if (!file) return;
+
+      try {
+        const data = await uploadBulletinFile(file);
+        syncArchiveEverywhere(data.bulletins);
+        select.value = data.filename;
+        select.dataset.lastValid = data.filename;
+      } catch (err) {
+        errorBox.textContent = err.message;
+        errorBox.style.display = 'block';
+      } finally {
+        fileInput.value = '';
+      }
+    }
+
+    async function handleWidgetUpload(fileInputId, fileNameLabelId, errorBoxId) {
+      const prefix = fileInputId.replace(/File$/, '');
+      const fileInput = document.getElementById(fileInputId);
+      const btn = document.getElementById(prefix + 'Btn');
+      const spinner = document.getElementById(prefix + 'Spinner');
+      const errorBox = document.getElementById(errorBoxId);
+      const file = fileInput.files[0];
+
+      if (!file) {
+        errorBox.textContent = 'Please choose a bulletin PDF first.';
+        errorBox.style.display = 'block';
+        return;
+      }
+
+      btn.disabled = true;
+      spinner.style.display = 'inline';
+      errorBox.style.display = 'none';
+
+      try {
+        const data = await uploadBulletinFile(file);
+        fileInput.value = '';
+        setFileName(fileInputId, fileNameLabelId);
+        syncArchiveEverywhere(data.bulletins);
+      } catch (err) {
+        errorBox.textContent = err.message;
+        errorBox.style.display = 'block';
+      } finally {
+        btn.disabled = false;
+        spinner.style.display = 'none';
+      }
+    }
+
+    async function runComparison() {
+      const a = document.getElementById('bulletinASelect').value;
+      const b = document.getElementById('bulletinBSelect').value;
+      const btn = document.getElementById('compareBtn');
+      const spinner = document.getElementById('compareSpinner');
       const errorBox = document.getElementById('errorBox');
 
-      if (!prev || !curr) {
-        errorBox.textContent = 'Please select both PDF files.';
+      if (!a || !b) {
+        errorBox.textContent = 'Please select two bulletins to compare.';
+        errorBox.style.display = 'block';
+        return;
+      }
+      if (a === b) {
+        errorBox.textContent = 'Please select two different bulletins.';
         errorBox.style.display = 'block';
         return;
       }
@@ -991,14 +1960,11 @@ TEMPLATE = """
       errorBox.style.display = 'none';
       hideAllCategories();
 
-      const formData = new FormData();
-      formData.append('previous_pdf', prev);
-      formData.append('current_pdf', curr);
-
       try {
         const resp = await fetch('/generate', {
           method: 'POST',
-          body: formData,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ bulletin_a: a, bulletin_b: b })
         });
         const data = await resp.json();
 
@@ -1017,16 +1983,27 @@ TEMPLATE = """
       }
     }
 
-    function pickFile(inputId) {
-      document.getElementById(inputId).click();
+    // ---- Home / section navigation ----
+
+    const VIEWS = ['home', 'compare', 'predict', 'admin'];
+
+    function showView(view) {
+      if (!VIEWS.includes(view)) view = 'home';
+      VIEWS.forEach(v => {
+        document.getElementById(v + 'View').style.display = (v === view) ? 'flex' : 'none';
+      });
+      window.scrollTo(0, 0);
+      if (view === 'admin') fetchArchive();
     }
 
-    function setFileName(inputId, labelId) {
-      const input = document.getElementById(inputId);
-      const label = document.getElementById(labelId);
-      const file = input.files && input.files[0];
-      label.textContent = file ? file.name : 'No file chosen';
+    function navigateTo(view) {
+      location.hash = view === 'home' ? '' : view;
+      showView(view);
     }
+
+    window.addEventListener('hashchange', () => {
+      showView(location.hash.replace('#', '') || 'home');
+    });
 
     document.addEventListener('click', e => {
       const btn = e.target.closest('.copy-btn');
@@ -1041,18 +2018,27 @@ TEMPLATE = """
       });
     });
 
-    // Allow Enter key in the input to trigger generate
     document.addEventListener('DOMContentLoaded', () => {
-      buildCategorySections();
+      buildCategorySections(CATEGORIES);
+      buildCategorySections(PROJECTION_CATEGORIES);
+
       document.getElementById('month').addEventListener('keydown', e => {
         if (e.key === 'Enter') generate();
       });
-      document.getElementById('previousPdf').addEventListener('change', () => {
-        setFileName('previousPdf', 'previousPdfName');
+      document.getElementById('lookback').addEventListener('keydown', e => {
+        if (e.key === 'Enter') projectFuture();
       });
-      document.getElementById('currentPdf').addEventListener('change', () => {
-        setFileName('currentPdf', 'currentPdfName');
+      document.getElementById('bulletinAUpload').addEventListener('change', () => handleInlineUpload('A'));
+      document.getElementById('bulletinBUpload').addEventListener('change', () => handleInlineUpload('B'));
+      document.getElementById('predictUploadFile').addEventListener('change', () => {
+        setFileName('predictUploadFile', 'predictUploadFileName');
       });
+      document.getElementById('adminUploadFile').addEventListener('change', () => {
+        setFileName('adminUploadFile', 'adminUploadFileName');
+      });
+
+      fetchArchive();
+      showView(location.hash.replace('#', '') || 'home');
     });
   </script>
 </body>
@@ -1084,24 +2070,65 @@ def generate():
             return jsonify({"error": "Please upload both previous and current Visa Bulletin PDFs."}), 400
 
         try:
-            previous_pdf = previous_file.read()
-            current_pdf = current_file.read()
-            result = generate_csv_from_pdf(
-                previous_pdf,
-                current_pdf,
-                previous_filename=previous_file.filename,
-                current_filename=current_file.filename,
+            result = generate_csv_from_pdf_auto_order(
+                previous_file.read(), previous_file.filename,
+                current_file.read(), current_file.filename,
             )
         except Exception as exc:
             return jsonify({"error": f"PDF parsing failed: {str(exc)}"}), 400
     else:
-        # Handle JSON requests for month-based generation
         body = request.get_json(silent=True) or {}
-        month_input = (body.get("month") or "").strip()
-        result = generate_csv(month_input)
+        bulletin_a = (body.get("bulletin_a") or "").strip()
+        bulletin_b = (body.get("bulletin_b") or "").strip()
+
+        if bulletin_a and bulletin_b:
+            try:
+                result = generate_csv_from_archive_selection(bulletin_a, bulletin_b)
+            except BulletinError as exc:
+                return jsonify({"error": str(exc)}), 400
+        else:
+            # Fall back to scraping the official site for a given month name.
+            month_input = (body.get("month") or "").strip()
+            result = generate_csv(month_input)
 
     if result["error"]:
         return jsonify({"error": result["error"]}), 400
+
+    return jsonify(result)
+
+
+@app.post("/project")
+def project():
+    body = request.get_json(silent=True) or {}
+    try:
+        lookback = int(body.get("lookback") or DEFAULT_LOOKBACK_MONTHS)
+    except (TypeError, ValueError):
+        lookback = DEFAULT_LOOKBACK_MONTHS
+
+    result = generate_projection(lookback)
+    if result["error"]:
+        return jsonify({"error": result["error"]}), 400
+
+    return jsonify(result)
+
+
+@app.get("/bulletins")
+def list_bulletins():
+    return jsonify({"bulletins": _list_bulletin_files()})
+
+
+@app.post("/bulletins/upload")
+def upload_bulletin():
+    uploaded = request.files.get("bulletin_pdf")
+    if not uploaded:
+        return jsonify({"error": "Please choose a Visa Bulletin PDF to upload."}), 400
+
+    try:
+        result = save_bulletin_pdf(uploaded.read(), filename_hint=uploaded.filename)
+    except BulletinUploadError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"error": f"Upload failed: {str(exc)}"}), 400
 
     return jsonify(result)
 
