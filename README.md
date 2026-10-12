@@ -103,16 +103,20 @@ uploaded pathname and original filename, not the file in the HTTP request.
 	the upload dialog. Credentials are not stored in browser storage.
 
 The file first lands under `incoming/`. Authenticated completion downloads it
-server-side, validates its PDF signature and supported tables, determines its
-month, and stores it under `bulletins/visabulletin_MonthYear.pdf`. Blob bulletins
+server-side, checks its PDF signature, reads the month/year from its filename,
+and stores its unchanged bytes under `bulletins/visabulletin_MonthYear.pdf`.
+Upload does not parse PDF text or tables. Blob bulletins
 override bundled PDFs of the same month. Comparison and prediction read private
 Blob content server-side; no read-write token or private PDF is served publicly.
 Same-month replacements use last-successful-write semantics.
 
-Unsupported documents are rejected rather than publishing empty prediction data.
-The 19-page October analysis PDF needs additional parser support, independently
-of its upload size. Uploads abandoned before completion, or interrupted by parsing
-or storage failures, can leave staging files; remove old `incoming/` files through
+PDFs can be uploaded even if they contain no supported bulletin tables, including
+the 19-page October analysis PDF. Comparison and prediction parse files only when
+those operations are requested; saving a file does not make its contents usable
+for those operations. Include the month and year in upload filenames, such as
+`Visa-Bulletin-October-2026.pdf`, so the monthly archive can label the file.
+Uploads abandoned before completion or interrupted by storage failures can leave
+staging files; remove old `incoming/` files through
 the Blob dashboard. Published files remain intact if staging cleanup fails.
 
 Without Blob, local Flask uploads still use `bulletins/`. On Vercel, Blob and an

@@ -9,13 +9,11 @@ Endpoints:
 
 import io
 import hmac
-import hashlib
 import os
 import re
 import sys
 from contextlib import contextmanager
 from datetime import datetime
-from importlib.metadata import version
 from dateutil import parser as dparser
 from dateutil.relativedelta import relativedelta
 
@@ -825,19 +823,16 @@ class BulletinNotFoundError(BulletinError):
 
 
 def save_bulletin_pdf(pdf_bytes: bytes, filename_hint: str = None) -> dict:
-    """Validate and persist an uploaded bulletin PDF into bulletins/ so future
-    projections can trend it. The destination filename is derived entirely
-    from the parsed bulletin month/year (never from the client-supplied name),
-    which keeps the write confined to BULLETINS_DIR."""
+    """Store PDF bytes without parsing their contents, using a canonical month filename."""
     if not pdf_bytes:
         raise BulletinUploadError("The uploaded file is empty.")
     if not pdf_bytes.lstrip().startswith(b"%PDF"):
         raise BulletinUploadError("The uploaded file does not look like a valid PDF.")
 
-    label = _parse_pdf_label(pdf_bytes) or _parse_label_from_filename(filename_hint)
+    label = _parse_label_from_filename(filename_hint)
     if not label:
         raise BulletinUploadError(
-            "Could not determine the bulletin's month and year from the PDF or its filename."
+            "Include the bulletin month and year in the filename, such as visabulletin_October2026.pdf."
         )
     try:
         month_dt = dparser.parse(label).replace(day=1)
@@ -1589,7 +1584,7 @@ TEMPLATE = """
       <button id="predictUploadBtn" onclick="handleWidgetUpload('predictUploadFile', 'predictUploadFileName', 'predictUploadErrorBox')">Save to Archive</button>
       <span class="spinner" id="predictUploadSpinner">⏳ Saving…</span>
     </div>
-    <p class="hint">The month/year is read from the PDF itself, so it's saved with the right filename automatically.</p>
+    <p class="hint">Include the month and year in the filename, for example visabulletin_October2026.pdf.</p>
     <div class="error" id="predictUploadErrorBox"></div>
     <p class="hint" id="archiveStatus"></p>
 
@@ -1636,7 +1631,7 @@ TEMPLATE = """
         <button id="adminUploadBtn" onclick="handleWidgetUpload('adminUploadFile', 'adminUploadFileName', 'adminUploadErrorBox')">Save to Archive</button>
         <span class="spinner" id="adminUploadSpinner">⏳ Saving…</span>
       </div>
-      <p class="hint">The month/year is read from the PDF itself, so it's saved with the right filename automatically.</p>
+      <p class="hint">Include the month and year in the filename, for example visabulletin_October2026.pdf.</p>
       <div class="error" id="adminUploadErrorBox"></div>
 
       <h2 style="color:#8ee6a0; font-size:1rem; margin-top:24px; margin-bottom:0;">Archived Bulletins</h2>
@@ -2278,31 +2273,13 @@ def complete_bulletin_upload():
     try:
         with _blob_archive() as archive:
             pdf_bytes = archive.read(pathname)
-        if not pdf_bytes.lstrip().startswith(b"%PDF"):
-            raise BulletinUploadError("The uploaded file does not look like a valid PDF.")
-        snapshot = _snapshot_from_pdf(pdf_bytes)
-        if not any(snapshot.values()):
-            raise BulletinUploadError(
-                "The PDF was uploaded, but no supported Visa Bulletin tables were found. "
-                "Use a standard bulletin PDF; analysis documents need additional parser support."
-            )
         result = save_bulletin_pdf(pdf_bytes, filename_hint=filename_hint)
     except (BlobError, ArchiveStorageError):
         raise
     except BulletinUploadError as exc:
         with _blob_archive() as archive:
             archive.discard(pathname)
-        return jsonify({
-            "error": str(exc),
-            "diagnostics": {
-                "received_bytes": len(pdf_bytes),
-                "sha256": hashlib.sha256(pdf_bytes).hexdigest(),
-                "pdfplumber_version": version("pdfplumber"),
-                "pdfminer_version": version("pdfminer.six"),
-            },
-        }), 400
-    except (ValueError, TypeError):
-        return jsonify({"error": "The uploaded PDF could not be parsed."}), 400
+        return jsonify({"error": str(exc)}), 400
     with _blob_archive() as archive:
         try:
             archive.discard(pathname)

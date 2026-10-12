@@ -1,10 +1,8 @@
 import io
-import hashlib
 import os
 import unittest
 from contextlib import contextmanager
 from datetime import datetime
-from importlib.metadata import version
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -129,7 +127,7 @@ class BlobArchiveTests(unittest.TestCase):
         self.assertEqual(self.blobs.files["bulletins/" + response.json["filename"]], data)
         self.assertNotIn(pathname, self.blobs.files)
 
-    def test_unsupported_pdf_returns_received_file_fingerprint(self):
+    def test_pdf_without_bulletin_tables_is_saved_as_a_file(self):
         with io.BytesIO() as output:
             with Image.new("RGB", (8, 8), "white") as image:
                 image.save(output, format="PDF")
@@ -138,14 +136,20 @@ class BlobArchiveTests(unittest.TestCase):
         self.blobs.files[pathname] = pdf_bytes
         response = self.client.post("/bulletins/complete", headers=self.auth,
                                     json={"pathname": pathname, "filename": "October2026.pdf"})
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.json["diagnostics"], {
-            "received_bytes": len(pdf_bytes),
-            "sha256": hashlib.sha256(pdf_bytes).hexdigest(),
-            "pdfplumber_version": version("pdfplumber"),
-            "pdfminer_version": version("pdfminer.six"),
-        })
+        self.assertEqual(response.status_code, 200, response.json)
+        self.assertEqual(self.blobs.files["bulletins/visabulletin_October2026.pdf"], pdf_bytes)
         self.assertNotIn(pathname, self.blobs.files)
+
+    def test_upload_does_not_invoke_pdf_parsers(self):
+        pdf_bytes = b"%PDF-file-bytes-only"
+        pathname = "incoming/" + "a" * 32 + ".pdf"
+        self.blobs.files[pathname] = pdf_bytes
+        with patch.object(index, "_snapshot_from_pdf", side_effect=AssertionError("must not parse tables")), \
+                patch.object(index, "_parse_pdf_label", side_effect=AssertionError("must not parse PDF text")):
+            response = self.client.post("/bulletins/complete", headers=self.auth,
+                                        json={"pathname": pathname, "filename": "October2026.pdf"})
+        self.assertEqual(response.status_code, 200, response.json)
+        self.assertEqual(self.blobs.files["bulletins/visabulletin_October2026.pdf"], pdf_bytes)
 
     def test_comparison_reads_blob_pdf(self):
         filenames = [entry["filename"] for entry in index._local_bulletin_files()[:2]]
