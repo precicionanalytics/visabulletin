@@ -8,9 +8,11 @@ Endpoints:
 """
 
 import io
+import hmac
 import os
 import re
 import sys
+from contextlib import contextmanager
 from datetime import datetime
 from dateutil import parser as dparser
 from dateutil.relativedelta import relativedelta
@@ -20,8 +22,11 @@ import pdfplumber
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, render_template_string, request, jsonify
+from vercel.blob import BlobClient, BlobError
 
-app = Flask(__name__)
+from bulletin_storage import BlobBulletinArchive, ArchiveStorageError, MAX_PDF_BYTES, INCOMING_PATTERN
+
+app = Flask(__name__, static_folder=os.path.join(os.path.dirname(os.path.dirname(__file__)), "public", "static"))
 app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
@@ -734,37 +739,33 @@ def _snapshot_from_pdf(pdf_bytes: bytes) -> dict:
 
 def _load_bulletin_history() -> list:
     """Return [(month_datetime, label, snapshot), ...] sorted oldest to newest."""
-    if not os.path.isdir(BULLETINS_DIR):
-        return []
-
     history = []
-    for filename in sorted(os.listdir(BULLETINS_DIR)):
-        if not filename.lower().endswith(".pdf"):
-            continue
+    for entry in _archive_entries():
+        filename = entry["filename"]
         path = os.path.join(BULLETINS_DIR, filename)
-        label = _parse_label_from_filename(filename)
-        if not label:
-            continue
-        try:
-            month_dt = dparser.parse(label).replace(day=1)
-        except Exception:
-            continue
-
-        stat = os.stat(path)
-        cache_key = (path, stat.st_mtime, stat.st_size)
+        label = entry["label"]
+        month_dt = dparser.parse(label).replace(day=1)
+        if entry["source"] == "blob":
+            cache_key = ("blob", filename, entry["version"])
+        else:
+            stat = os.stat(path)
+            cache_key = (path, stat.st_mtime, stat.st_size)
         snapshot = _SNAPSHOT_CACHE.get(cache_key)
         if snapshot is None:
-            with open(path, "rb") as handle:
-                snapshot = _snapshot_from_pdf(handle.read())
+            if entry["source"] == "blob":
+                with _blob_archive() as archive:
+                    pdf_bytes = archive.read("bulletins/" + filename)
+            else:
+                with open(path, "rb") as handle:
+                    pdf_bytes = handle.read()
+            snapshot = _snapshot_from_pdf(pdf_bytes)
             _SNAPSHOT_CACHE[cache_key] = snapshot
-
         history.append((month_dt, month_dt.strftime("%B %Y"), snapshot))
-
     history.sort(key=lambda item: item[0])
     return history
 
 
-def _list_bulletin_files() -> list:
+def _local_bulletin_files() -> list:
     """Lightweight archive listing (filename + label only, no PDF parsing) for
     the UI's archive status display."""
     if not os.path.isdir(BULLETINS_DIR):
@@ -783,6 +784,30 @@ def _list_bulletin_files() -> list:
         entries.append((month_dt, label, filename))
     entries.sort(key=lambda item: item[0])
     return [{"label": label, "filename": filename} for _, label, filename in entries]
+
+
+@contextmanager
+def _blob_archive():
+    with BlobClient(token=os.environ.get("BLOB_READ_WRITE_TOKEN")) as client:
+        yield BlobBulletinArchive(client)
+
+
+def _archive_entries() -> list:
+    entries = {
+        entry["filename"]: dict(entry, source="local")
+        for entry in _local_bulletin_files()
+    }
+    if os.environ.get("BLOB_READ_WRITE_TOKEN"):
+        with _blob_archive() as archive:
+            for entry in archive.entries():
+                label = _parse_label_from_filename(entry["filename"])
+                if label:
+                    entries[entry["filename"]] = dict(entry, label=label, source="blob")
+    return sorted(entries.values(), key=lambda entry: dparser.parse(entry["label"]))
+
+
+def _list_bulletin_files() -> list:
+    return [{"label": entry["label"], "filename": entry["filename"]} for entry in _archive_entries()]
 
 
 class BulletinError(Exception):
@@ -818,11 +843,16 @@ def save_bulletin_pdf(pdf_bytes: bytes, filename_hint: str = None) -> dict:
         raise BulletinUploadError(f"Could not parse a valid month/year from '{label}'.")
 
     filename = f"visabulletin_{month_dt.strftime('%B%Y')}.pdf"
-    path = os.path.join(BULLETINS_DIR, filename)
-    os.makedirs(BULLETINS_DIR, exist_ok=True)
-
-    replaced = os.path.exists(path)
-    with open(path, "wb") as handle:
+    replaced = filename in {entry["filename"] for entry in _list_bulletin_files()}
+    if os.environ.get("BLOB_READ_WRITE_TOKEN"):
+      with _blob_archive() as archive:
+        archive.write(filename, pdf_bytes)
+    else:
+      if os.environ.get("VERCEL"):
+        raise BulletinUploadError("Connect the private Blob store before uploading on Vercel.")
+      path = os.path.join(BULLETINS_DIR, filename)
+      os.makedirs(BULLETINS_DIR, exist_ok=True)
+      with open(path, "wb") as handle:
         handle.write(pdf_bytes)
 
     return {
@@ -836,9 +866,12 @@ def save_bulletin_pdf(pdf_bytes: bytes, filename_hint: str = None) -> dict:
 def _read_bulletin_file(filename: str) -> bytes:
     """Read a bulletin PDF from the archive by filename, validated against the
     current archive listing so client input can never escape BULLETINS_DIR."""
-    valid_names = {entry["filename"] for entry in _list_bulletin_files()}
-    if filename not in valid_names:
+    entries = {entry["filename"]: entry for entry in _archive_entries()}
+    if filename not in entries:
         raise BulletinNotFoundError(f"'{filename}' was not found in the bulletins archive.")
+    if entries[filename]["source"] == "blob":
+      with _blob_archive() as archive:
+        return archive.read("bulletins/" + filename)
     with open(os.path.join(BULLETINS_DIR, filename), "rb") as handle:
         return handle.read()
 
@@ -1543,7 +1576,7 @@ TEMPLATE = """
     <div class="card">
     <p class="hint" style="margin-top:0;">
       Forecasts the next (unpublished) month for every category by trending the bulletin PDFs
-      stored in the <code>bulletins/</code> folder. Projection only — not an official forecast.
+      stored in the bulletin archive. Projection only — not an official forecast.
     </p>
 
     <label>Add a bulletin PDF to the archive</label>
@@ -1613,6 +1646,18 @@ TEMPLATE = """
     </div>
   </div>
 
+  <dialog id="uploadAuthDialog" style="background:#1b1b1b;color:#eee;border:1px solid #555;border-radius:8px;width:320px;max-width:calc(100% - 48px);">
+    <form method="dialog">
+      <h2 style="font-size:1.1rem;">Admin Access</h2>
+      <label for="uploadAdminPassword">Admin password</label>
+      <input id="uploadAdminPassword" type="password" autocomplete="current-password" required style="box-sizing:border-box;width:100%;">
+      <div class="row" style="margin-top:16px;justify-content:flex-end;">
+        <button value="cancel" formnovalidate>Cancel</button>
+        <button value="upload">Continue</button>
+      </div>
+    </form>
+  </dialog>
+  <script src="/static/blob-client.js"></script>
   <script>
     const CATEGORIES = [
       { key: 'eb', title: 'Employment-Based (EB1, EB2 & EB3)', csvField: 'csv', promptField: 'prompt' },
@@ -1769,13 +1814,56 @@ TEMPLATE = """
 
     // ---- Archive helpers shared by the Compare / Predict / Admin views ----
 
+    function requestUploadPassword() {
+      const dialog = document.getElementById('uploadAuthDialog');
+      const input = document.getElementById('uploadAdminPassword');
+      if (dialog.open) return Promise.reject(new Error('Complete the current admin prompt first.'));
+      return new Promise((resolve, reject) => {
+        dialog.returnValue = '';
+        input.value = '';
+        dialog.addEventListener('close', () => {
+          const password = input.value;
+          input.value = '';
+          if (dialog.returnValue === 'upload' && password) resolve(password);
+          else reject(new Error('Upload cancelled.'));
+        }, { once: true });
+        dialog.showModal();
+        input.focus();
+      });
+    }
+
     async function uploadBulletinFile(file) {
-      const formData = new FormData();
-      formData.append('bulletin_pdf', file);
-      const resp = await fetch('/bulletins/upload', { method: 'POST', body: formData });
-      const data = await resp.json();
-      if (data.error) throw new Error(data.error);
-      return data;
+      async function readResponse(resp) {
+        if (resp.status === 413) throw new Error('Upload exceeds the server request limit. Connect Blob storage for PDFs above 4.5 MB.');
+        if (!(resp.headers.get('content-type') || '').includes('application/json')) {
+          throw new Error('Upload failed (HTTP ' + resp.status + '). The server did not return a JSON response.');
+        }
+        const data = await resp.json();
+        if (!resp.ok || data.error) throw new Error(data.error || 'Upload failed (HTTP ' + resp.status + ').');
+        return data;
+      }
+      const config = await readResponse(await fetch('/bulletins/upload-config', { cache: 'no-store' }));
+      if (!file.size) throw new Error('The uploaded file is empty.');
+      if (file.size > config.max_bytes) throw new Error('PDF exceeds the ' + (config.max_bytes / 1024 / 1024).toFixed(1) + ' MB upload limit.');
+      if (!file.name.toLowerCase().endsWith('.pdf')) throw new Error('Please choose a PDF file.');
+      const password = config.auth_required ? await requestUploadPassword() : '';
+      const headers = password ? { Authorization: 'Bearer ' + password } : {};
+      let response;
+      if (config.blob_enabled) {
+        if (typeof window.uploadPrivateBulletin !== 'function') throw new Error('The Blob upload client did not load. Refresh and retry.');
+        const pathname = 'incoming/' + crypto.randomUUID().replaceAll('-', '') + '.pdf';
+        const blob = await window.uploadPrivateBulletin(pathname, file, password);
+        response = await fetch('/bulletins/complete', {
+          method: 'POST',
+          headers: { ...headers, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pathname: blob.pathname, filename: file.name }),
+        });
+      } else {
+        const formData = new FormData();
+        formData.append('bulletin_pdf', file);
+        response = await fetch('/bulletins/upload', { method: 'POST', headers, body: formData });
+      }
+      return readResponse(response);
     }
 
     function renderArchiveStatus(bulletins) {
@@ -1928,6 +2016,10 @@ TEMPLATE = """
         fileInput.value = '';
         setFileName(fileInputId, fileNameLabelId);
         syncArchiveEverywhere(data.bulletins);
+        if (data.warning) {
+          errorBox.textContent = data.warning;
+          errorBox.style.display = 'block';
+        }
       } catch (err) {
         errorBox.textContent = err.message;
         errorBox.style.display = 'block';
@@ -2055,9 +2147,42 @@ def healthy():
     return jsonify({"status": "ok", "service": "visa-bulletin-tracker", "timestamp": datetime.utcnow().isoformat() + "Z"})
 
 
+@app.before_request
+def authorize_archive_uploads():
+    if request.method != "POST" or request.path not in ("/bulletins/upload", "/bulletins/complete"):
+        return None
+    password = os.environ.get("UPLOAD_ADMIN_PASSWORD")
+    if not password:
+        if os.environ.get("VERCEL") or os.environ.get("BLOB_READ_WRITE_TOKEN"):
+            return jsonify({"error": "Set UPLOAD_ADMIN_PASSWORD to enable archive uploads."}), 503
+        return None
+    supplied = request.headers.get("Authorization", "")
+    expected = "Bearer " + password
+    if not hmac.compare_digest(supplied.encode(), expected.encode()):
+        return jsonify({"error": "Incorrect admin password."}), 401
+    return None
+
+
+@app.errorhandler(BlobError)
+@app.errorhandler(ArchiveStorageError)
+def storage_unavailable(error):
+    return jsonify({"error": "Blob archive is unavailable. Check the store connection and retry."}), 503
+
+
+@app.get("/bulletins/upload-config")
+def bulletin_upload_config():
+    blob_enabled = bool(os.environ.get("BLOB_READ_WRITE_TOKEN"))
+    request_limit = 4_500_000 if os.environ.get("VERCEL") else app.config["MAX_CONTENT_LENGTH"]
+    return jsonify({
+        "blob_enabled": blob_enabled,
+        "max_bytes": MAX_PDF_BYTES if blob_enabled else request_limit - 64_000,
+        "auth_required": bool(os.environ.get("UPLOAD_ADMIN_PASSWORD")) or blob_enabled or bool(os.environ.get("VERCEL")),
+    })
+
+
 @app.get("/")
 def index():
-    return render_template_string(TEMPLATE)
+  return render_template_string(TEMPLATE)
 
 
 @app.post("/generate")
@@ -2125,6 +2250,8 @@ def upload_bulletin():
 
     try:
         result = save_bulletin_pdf(uploaded.read(), filename_hint=uploaded.filename)
+    except (BlobError, ArchiveStorageError):
+      raise
     except BulletinUploadError as exc:
         return jsonify({"error": str(exc)}), 400
     except Exception as exc:
@@ -2133,6 +2260,45 @@ def upload_bulletin():
     return jsonify(result)
 
 
+@app.post("/bulletins/complete")
+def complete_bulletin_upload():
+    if not os.environ.get("BLOB_READ_WRITE_TOKEN"):
+        return jsonify({"error": "Connect the private Blob store before uploading."}), 503
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "Invalid upload completion request."}), 400
+    pathname = body.get("pathname")
+    filename_hint = body.get("filename")
+    if not isinstance(pathname, str) or not INCOMING_PATTERN.fullmatch(pathname):
+        return jsonify({"error": "Invalid upload destination."}), 400
+    if not isinstance(filename_hint, str) or len(filename_hint) > 255:
+        return jsonify({"error": "Invalid PDF filename."}), 400
+    try:
+        with _blob_archive() as archive:
+            pdf_bytes = archive.read(pathname)
+        if not pdf_bytes.lstrip().startswith(b"%PDF"):
+            raise BulletinUploadError("The uploaded file does not look like a valid PDF.")
+        snapshot = _snapshot_from_pdf(pdf_bytes)
+        if not any(snapshot.values()):
+            raise BulletinUploadError(
+                "The PDF was uploaded, but no supported Visa Bulletin tables were found. "
+                "Use a standard bulletin PDF; analysis documents need additional parser support."
+            )
+        result = save_bulletin_pdf(pdf_bytes, filename_hint=filename_hint)
+    except (BlobError, ArchiveStorageError):
+        raise
+    except BulletinUploadError as exc:
+        with _blob_archive() as archive:
+            archive.discard(pathname)
+        return jsonify({"error": str(exc)}), 400
+    except (ValueError, TypeError):
+        return jsonify({"error": "The uploaded PDF could not be parsed."}), 400
+    with _blob_archive() as archive:
+        try:
+            archive.discard(pathname)
+        except BlobError:
+            result["warning"] = "Bulletin saved, but its staging copy could not be removed."
+    return jsonify(result)
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------

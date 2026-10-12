@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.playwright_profile/
+node_modules/
+public/static/blob-client.js
+.env
+.env.*
+.vercel/
