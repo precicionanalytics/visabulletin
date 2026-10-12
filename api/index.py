@@ -9,11 +9,13 @@ Endpoints:
 
 import io
 import hmac
+import hashlib
 import os
 import re
 import sys
 from contextlib import contextmanager
 from datetime import datetime
+from importlib.metadata import version
 from dateutil import parser as dparser
 from dateutil.relativedelta import relativedelta
 
@@ -2290,7 +2292,15 @@ def complete_bulletin_upload():
     except BulletinUploadError as exc:
         with _blob_archive() as archive:
             archive.discard(pathname)
-        return jsonify({"error": str(exc)}), 400
+        return jsonify({
+            "error": str(exc),
+            "diagnostics": {
+                "received_bytes": len(pdf_bytes),
+                "sha256": hashlib.sha256(pdf_bytes).hexdigest(),
+                "pdfplumber_version": version("pdfplumber"),
+                "pdfminer_version": version("pdfminer.six"),
+            },
+        }), 400
     except (ValueError, TypeError):
         return jsonify({"error": "The uploaded PDF could not be parsed."}), 400
     with _blob_archive() as archive:

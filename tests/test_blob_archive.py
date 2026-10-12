@@ -1,11 +1,14 @@
 import io
+import hashlib
 import os
 import unittest
 from contextlib import contextmanager
 from datetime import datetime
+from importlib.metadata import version
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from PIL import Image
 from api import index
 from bulletin_storage import BlobBulletinArchive, MAX_PDF_BYTES
 
@@ -124,6 +127,24 @@ class BlobArchiveTests(unittest.TestCase):
                                         json={"pathname": pathname, "filename": filename})
         self.assertEqual(response.status_code, 200, response.json)
         self.assertEqual(self.blobs.files["bulletins/" + response.json["filename"]], data)
+        self.assertNotIn(pathname, self.blobs.files)
+
+    def test_unsupported_pdf_returns_received_file_fingerprint(self):
+        with io.BytesIO() as output:
+            with Image.new("RGB", (8, 8), "white") as image:
+                image.save(output, format="PDF")
+            pdf_bytes = output.getvalue()
+        pathname = "incoming/" + "a" * 32 + ".pdf"
+        self.blobs.files[pathname] = pdf_bytes
+        response = self.client.post("/bulletins/complete", headers=self.auth,
+                                    json={"pathname": pathname, "filename": "October2026.pdf"})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json["diagnostics"], {
+            "received_bytes": len(pdf_bytes),
+            "sha256": hashlib.sha256(pdf_bytes).hexdigest(),
+            "pdfplumber_version": version("pdfplumber"),
+            "pdfminer_version": version("pdfminer.six"),
+        })
         self.assertNotIn(pathname, self.blobs.files)
 
     def test_comparison_reads_blob_pdf(self):
