@@ -152,7 +152,7 @@ class BlobArchiveTests(unittest.TestCase):
         self.assertEqual(self.blobs.files["bulletins/visabulletin_October2026.pdf"], pdf_bytes)
 
     def test_comparison_reads_blob_pdf(self):
-        filenames = [entry["filename"] for entry in index._local_bulletin_files()[:2]]
+        filenames = ["visabulletin_October2026.pdf", "visabulletin_November2026.pdf"]
         with open(os.path.join(index.BULLETINS_DIR, filenames[1]), "rb") as handle:
             self.blobs.files["bulletins/" + filenames[1]] = handle.read()
         response = self.client.post("/generate", json={"bulletin_a": filenames[0], "bulletin_b": filenames[1]})

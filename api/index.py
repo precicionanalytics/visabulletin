@@ -474,6 +474,22 @@ def _table_rows_to_dict(
     return data
 
 
+def _missing_eb_table_error(prev_label, curr_label, prev_final, curr_final, prev_filing, curr_filing):
+    for label, final, filing in [
+        (prev_label, prev_final, prev_filing),
+        (curr_label, curr_final, curr_filing),
+    ]:
+        for table_name, table in [("Final Action Dates", final), ("Dates for Filing", filing)]:
+            if table is None or len(table) == 0:
+                return (
+                    f"Could not read the employment-based {table_name} table for {label}. "
+                    "Select or upload a Visa Bulletin containing both employment-based tables. "
+                    "An analysis-only PDF may not contain readable tables; "
+                    "missing data cannot be treated as unchanged."
+                )
+    return ""
+
+
 def generate_csv_from_pdf(previous_pdf: bytes, current_pdf: bytes, previous_filename: str = None, current_filename: str = None) -> dict:
     prev_label = (
         _parse_pdf_label(previous_pdf)
@@ -489,11 +505,11 @@ def generate_csv_from_pdf(previous_pdf: bytes, current_pdf: bytes, previous_file
     prev_final, prev_filing = _find_eb_tables_from_pdf(previous_pdf)
     curr_final, curr_filing = _find_eb_tables_from_pdf(current_pdf)
 
-    if not curr_final:
-        return _error_result(prev_label, curr_label, (
-            "Could not find the employment-based table in the current PDF. "
-            "Please make sure the PDF contains the Visa Bulletin employment-based tables."
-        ))
+    table_error = _missing_eb_table_error(
+        prev_label, curr_label, prev_final, curr_final, prev_filing, curr_filing,
+    )
+    if table_error:
+        return _error_result(prev_label, curr_label, table_error)
 
     to_eb_dict = lambda raw: _table_rows_to_dict(
         raw, EB_FULL_CATEGORY_KEYS, EB_COUNTRIES, key_normalizer=_normalize_eb_category_key,
@@ -670,11 +686,11 @@ def generate_csv(month_input: str) -> dict:
     prev_final, prev_filing = _get_eb_tables(prev_html)
     curr_final, curr_filing = _get_eb_tables(curr_html)
 
-    if not curr_final:
-      return _error_result(prev_label, curr_label, (
-            f"Could not find employment-based table for {curr_label}. "
-            "The bulletin may not be published yet."
-      ))
+    table_error = _missing_eb_table_error(
+        prev_label, curr_label, prev_final, curr_final, prev_filing, curr_filing,
+    )
+    if table_error:
+        return _error_result(prev_label, curr_label, table_error)
 
     eb_final, eb_filing, eb_sub_final, eb_sub_filing = _build_eb_full_comparisons(
         prev_final, curr_final, prev_filing, curr_filing,

@@ -115,6 +115,14 @@ the 19-page October analysis PDF. Comparison and prediction parse files only whe
 those operations are requested; saving a file does not make its contents usable
 for those operations. Include the month and year in upload filenames, such as
 `Visa-Bulletin-October-2026.pdf`, so the monthly archive can label the file.
+Month Comparison requires readable employment-based Final Action Dates and Dates
+for Filing tables in **both** selected months. If a table is missing, comparison
+returns an error naming the month and table instead of exporting blank previous
+values or silently omitting filing dates. This also applies to website comparisons.
+Replace an analysis-only PDF with a bulletin containing those tables before
+comparing. On Vercel, replace the file through Admin if that month already exists
+in Blob: adding a corrected PDF to Git does not replace the Blob override.
+
 Uploads abandoned before completion or interrupted by storage failures can leave
 staging files; remove old `incoming/` files through
 the Blob dashboard. Published files remain intact if staging cleanup fails.
